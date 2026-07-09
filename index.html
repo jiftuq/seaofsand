@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SEA OF SAND — trampler test</title>
+<title>SEA OF SAND</title>
 <style>
   html,body{margin:0;padding:0;overflow:hidden;background:#0c0c0e;font-family:'Courier New',monospace}
   #hud{position:fixed;top:12px;left:12px;color:#e8b04a;font-size:12px;line-height:1.7;
@@ -13,18 +13,86 @@
     font-size:18px;pointer-events:none;opacity:.8}
   #msg{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);color:#e8b04a;
     font-size:13px;letter-spacing:2px;pointer-events:none;opacity:0;transition:opacity .5s}
+
+  /* ---- lobby ---- */
+  #lobby{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+    background:rgba(12,12,14,.55);backdrop-filter:blur(2px);z-index:10}
+  #lobby.hidden{display:none}
+  .panel{width:min(680px,92vw);max-height:88vh;overflow-y:auto;border:1px solid #6b4a2a;
+    background:rgba(16,14,11,.92);padding:28px 32px;color:#e8b04a;
+    box-shadow:0 0 40px rgba(232,176,74,.15)}
+  .panel h1{margin:0 0 2px;font-size:26px;letter-spacing:6px;color:#fff;
+    text-shadow:0 0 12px rgba(232,176,74,.6)}
+  .panel .sub{margin:0 0 20px;font-size:11px;letter-spacing:3px;opacity:.7}
+  .panel h2{font-size:12px;letter-spacing:3px;border-bottom:1px solid #6b4a2a;
+    padding-bottom:4px;margin:22px 0 10px}
+  .frames{display:flex;gap:10px}
+  .frame{flex:1;border:1px solid #6b4a2a;padding:10px;cursor:pointer;text-align:center}
+  .frame:hover{border-color:#e8b04a}
+  .frame.sel{border-color:#e8b04a;background:rgba(232,176,74,.12)}
+  .frame .fname{color:#fff;font-size:12px;letter-spacing:1px}
+  .frame .fdesc{font-size:10px;opacity:.75;margin-top:4px;line-height:1.5}
+  .swatches{display:flex;gap:8px}
+  .swatch{width:34px;height:24px;border:1px solid #6b4a2a;cursor:pointer}
+  .swatch.sel{outline:2px solid #e8b04a}
+  .rooms{border:1px solid #6b4a2a}
+  .room{display:flex;justify-content:space-between;padding:8px 12px;cursor:pointer;
+    border-bottom:1px solid rgba(107,74,42,.4);font-size:12px}
+  .room:last-child{border-bottom:none}
+  .room:hover{background:rgba(232,176,74,.1)}
+  .room .rname{color:#fff;letter-spacing:1px}
+  .room .rcount{opacity:.8}
+  .room.full{opacity:.4;cursor:not-allowed}
+  .newroom{display:flex;gap:8px;margin-top:10px}
+  input[type=text]{flex:1;background:#0c0c0e;border:1px solid #6b4a2a;color:#e8b04a;
+    font-family:inherit;font-size:12px;padding:8px 10px;letter-spacing:1px;outline:none}
+  input[type=text]:focus{border-color:#e8b04a}
+  button{background:#1a150f;border:1px solid #b08840;color:#e8b04a;font-family:inherit;
+    font-size:12px;letter-spacing:2px;padding:8px 18px;cursor:pointer}
+  button:hover{background:#2a2015;color:#fff}
+  button.big{width:100%;margin-top:22px;padding:14px;font-size:14px;letter-spacing:4px}
+  #lobbyStatus{font-size:11px;opacity:.7;margin-top:10px;min-height:14px}
 </style>
 </head>
 <body>
 <div id="hud">
-  <b>TRAMPLER Mk.I</b> — Sophie surface test<br>
-  W/S throttle &nbsp; A/D steer &nbsp; MOUSE aim &nbsp; CLICK fire<br>
+  <b>SEA OF SAND</b> — <span id="hudRoom">open desert</span><br>
+  W/S throttle &nbsp; A/D steer &nbsp; MOUSE aim &nbsp; CLICK fire &nbsp; ESC lobby<br>
   speed: <span id="spd">0.0</span> m/s &nbsp; heading: <span id="hdg">0</span>°<br>
   <span id="target">derelict integrity: 100%</span><br>
   link: <span id="net">connecting…</span>
 </div>
 <div id="crosshair">+</div>
 <div id="msg"></div>
+
+<div id="lobby">
+  <div class="panel">
+    <h1>SEA OF SAND</h1>
+    <p class="sub">RAIDERS OF SOPHIE — SURFACE OPERATIONS</p>
+
+    <h2>CALLSIGN</h2>
+    <input type="text" id="callsign" maxlength="24" placeholder="raider name">
+
+    <h2>TRAMPLER FRAME</h2>
+    <div class="frames" id="frames"></div>
+
+    <h2>HULL PAINT</h2>
+    <div class="swatches" id="swatches"></div>
+
+    <h2>EXPEDITIONS</h2>
+    <div class="rooms" id="rooms">
+      <div class="room"><span class="rname">connecting…</span></div>
+    </div>
+    <div class="newroom">
+      <input type="text" id="roomName" maxlength="32" placeholder="new expedition name">
+      <button id="createRoom">FOUND</button>
+    </div>
+
+    <button class="big" id="enterDesert">ENTER OPEN DESERT</button>
+    <div id="lobbyStatus"></div>
+  </div>
+</div>
+
 <script type="module" src="/src/main.ts"></script>
 </body>
 </html>

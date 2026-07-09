@@ -4,9 +4,12 @@ export class Hud {
   private tgt = document.getElementById('target')!;
   private msg = document.getElementById('msg') as HTMLElement;
   private net = document.getElementById('net')!;
+  private room = document.getElementById('hudRoom')!;
   private msgTimer = 0;
 
   setNet(text: string): void { this.net.textContent = text; }
+
+  setRoom(text: string): void { this.room.textContent = text.toLowerCase(); }
 
   setSpeed(v: number): void { this.spd.textContent = Math.abs(v).toFixed(1); }
 

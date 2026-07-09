@@ -10,13 +10,6 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
-export default __t.row({
-  identity: __t.identity().primaryKey(),
+export default {
   name: __t.string(),
-  roomId: __t.u64().name("room_id"),
-  tramplerId: __t.option(__t.u64()).name("trampler_id"),
-  online: __t.bool(),
-  localX: __t.f32().name("local_x"),
-  localY: __t.f32().name("local_y"),
-  localZ: __t.f32().name("local_z"),
-});
+};

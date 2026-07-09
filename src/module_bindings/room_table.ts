@@ -12,17 +12,8 @@ import {
 
 export default __t.row({
   id: __t.u64().primaryKey(),
-  owner: __t.identity(),
-  roomId: __t.u64().name("room_id"),
-  posX: __t.f32().name("pos_x"),
-  posY: __t.f32().name("pos_y"),
-  posZ: __t.f32().name("pos_z"),
-  yaw: __t.f32(),
-  speed: __t.f32(),
-  throttle: __t.f32(),
-  steer: __t.f32(),
-  frameId: __t.u32().name("frame_id"),
-  color: __t.u32(),
-  hpHull: __t.u16().name("hp_hull"),
-  hpEngine: __t.u16().name("hp_engine"),
+  name: __t.string(),
+  host: __t.identity(),
+  createdAt: __t.timestamp().name("created_at"),
+  maxPlayers: __t.u32().name("max_players"),
 });

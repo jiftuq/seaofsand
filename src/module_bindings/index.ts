@@ -34,7 +34,9 @@ import {
 } from "spacetimedb";
 
 // Import all reducer arg schemas
+import CreateRoomReducer from "./create_room_reducer";
 import JoinReducer from "./join_reducer";
+import JoinRoomReducer from "./join_room_reducer";
 import SetInputReducer from "./set_input_reducer";
 import SpawnTramplerReducer from "./spawn_trampler_reducer";
 
@@ -42,6 +44,7 @@ import SpawnTramplerReducer from "./spawn_trampler_reducer";
 
 // Import all table schema definitions
 import PlayerRow from "./player_table";
+import RoomRow from "./room_table";
 import TramplerRow from "./trampler_table";
 
 /** Type-only namespace exports for generated type groups. */
@@ -59,11 +62,25 @@ const tablesSchema = __schema({
       { name: 'player_identity_key', constraint: 'unique', columns: ['identity'] },
     ],
   }, PlayerRow),
+  room: __table({
+    name: 'room',
+    indexes: [
+      { accessor: 'id', name: 'room_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+    ],
+    constraints: [
+      { name: 'room_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, RoomRow),
   trampler: __table({
     name: 'trampler',
     indexes: [
       { accessor: 'id', name: 'trampler_id_idx_btree', algorithm: 'btree', columns: [
         'id',
+      ] },
+      { accessor: 'room_id', name: 'trampler_room_id_idx_btree', algorithm: 'btree', columns: [
+        'roomId',
       ] },
     ],
     constraints: [
@@ -74,7 +91,9 @@ const tablesSchema = __schema({
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
+  __reducerSchema("create_room", CreateRoomReducer),
   __reducerSchema("join", JoinReducer),
+  __reducerSchema("join_room", JoinRoomReducer),
   __reducerSchema("set_input", SetInputReducer),
   __reducerSchema("spawn_trampler", SpawnTramplerReducer),
 );

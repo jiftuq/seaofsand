@@ -12,4 +12,5 @@ import {
 
 export default {
   frameId: __t.u32(),
+  color: __t.u32(),
 };

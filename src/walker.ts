@@ -1,15 +1,16 @@
 import * as THREE from 'three';
 import { terrainH } from './terrain';
+import { FRAMES } from './frames';
 
-// 6-leg walker: two-bone IK (law of cosines), tripod gait, feet planted in
-// world space. Purely cosmetic — the server will only ever sync pos/yaw/speed
-// (M2); everything below derives locally from those three values plus dt.
+// N-leg walker: two-bone IK (law of cosines), tripod gait, feet planted in
+// world space. Purely cosmetic — the server only ever syncs pos/yaw/speed;
+// everything below derives locally from those three values plus dt.
+// Frame presets (leg count, size, speed) come from frames.ts.
 
-const L1 = 5.2, L2 = 5.8;        // upper/lower leg segment lengths
-const CLEARANCE = 6.2;           // hull height above average foot
-const STEP_DUR = 0.32;           // seconds per step
-const STEP_TRIGGER = 2.2;        // foot error (m) that forces a step
-const MAXSPD = 9, ACCEL = 6, TURN = 0.7;
+const BASE_L1 = 5.2, BASE_L2 = 5.8;  // leg segment lengths at scale 1
+const BASE_CLEARANCE = 6.2;          // hull height above average foot
+const STEP_DUR = 0.32;               // seconds per step
+const ACCEL = 6, TURN = 0.7;
 
 const UP = new THREE.Vector3(0, 1, 0);
 
@@ -42,14 +43,6 @@ function box(w: number, h: number, d: number, m: THREE.Material,
   return b;
 }
 
-function makeSeg(len: number, r0: number, r1: number): THREE.Mesh {
-  const g = new THREE.CylinderGeometry(r1, r0, len, 8);
-  g.translate(0, len / 2, 0); // pivot at base
-  const m = new THREE.Mesh(g, mats.leg);
-  m.castShadow = true;
-  return m;
-}
-
 // scratch objects for solveLeg
 const _hipW = new THREE.Vector3();
 const _dir = new THREE.Vector3();
@@ -76,82 +69,101 @@ export class Walker {
   gaitPhase = 0;
 
   onFootfall?: (pos: THREE.Vector3) => void;
+  onSmokePuff?: (pos: THREE.Vector3) => void;
+
+  readonly maxSpd: number;
+  private readonly l1: number;
+  private readonly l2: number;
+  private readonly clearance: number;
+  private readonly stepTrigger: number;
 
   private legs: Leg[] = [];
   private stackTip: THREE.Mesh;
   private smokeT = 0;
-  onSmokePuff?: (pos: THREE.Vector3) => void;
+  private steerAbs = 0;
 
-  constructor(private scene: THREE.Scene) {
+  constructor(private scene: THREE.Scene, frameId = 1, color?: number) {
+    const frame = FRAMES[Math.min(frameId, FRAMES.length - 1)];
+    const s = frame.scale;
+    const legScale = Math.sqrt(s);
+    this.maxSpd = frame.maxSpd;
+    this.l1 = BASE_L1 * legScale;
+    this.l2 = BASE_L2 * legScale;
+    this.clearance = BASE_CLEARANCE * legScale;
+    this.stepTrigger = 2.2 * legScale;
+
     this.root.add(this.bodyRig);
     scene.add(this.root);
 
+    const hullMat = color !== undefined
+      ? new THREE.MeshStandardMaterial({ color, roughness: .85, metalness: .35 })
+      : mats.hull;
+
     // hull
-    box(6, 3.2, 11, mats.hull, 0, 0, 0, this.bodyRig);          // main hull
-    box(6.6, 0.4, 11.6, mats.dark, 0, 1.8, 0, this.bodyRig);    // deck rim
-    box(3.4, 2.2, 3.6, mats.dark, 0, 2.9, -3.2, this.bodyRig);  // wheelhouse aft
-    box(0.7, 3.5, 0.7, mats.brass, 2.2, 3.6, -4.6, this.bodyRig); // smokestack
-    this.stackTip = box(0.9, 0.3, 0.9, mats.dark, 2.2, 5.4, -4.6, this.bodyRig);
+    box(6 * s, 3.2 * s, 11 * s, hullMat, 0, 0, 0, this.bodyRig);                  // main hull
+    box(6.6 * s, 0.4 * s, 11.6 * s, mats.dark, 0, 1.8 * s, 0, this.bodyRig);      // deck rim
+    box(3.4 * s, 2.2 * s, 3.6 * s, mats.dark, 0, 2.9 * s, -3.2 * s, this.bodyRig); // wheelhouse aft
+    box(0.7 * s, 3.5 * s, 0.7 * s, mats.brass, 2.2 * s, 3.6 * s, -4.6 * s, this.bodyRig); // smokestack
+    this.stackTip = box(0.9 * s, 0.3 * s, 0.9 * s, mats.dark, 2.2 * s, 5.4 * s, -4.6 * s, this.bodyRig);
 
     // turret (yaw ring + pitching barrel)
-    this.turretYaw.position.set(0, 2.2, 2.8);
+    this.turretYaw.position.set(0, 2.2 * s, 2.8 * s);
     this.bodyRig.add(this.turretYaw);
-    box(1.8, 0.9, 1.8, mats.brass, 0, 0, 0, this.turretYaw);
-    this.turretPitch.position.set(0, 0.5, 0);
+    box(1.8 * s, 0.9 * s, 1.8 * s, mats.brass, 0, 0, 0, this.turretYaw);
+    this.turretPitch.position.set(0, 0.5 * s, 0);
     this.turretYaw.add(this.turretPitch);
-    const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.28, 4.4, 10), mats.dark);
+    const barrel = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.22 * s, 0.28 * s, 4.4 * s, 10), mats.dark);
     barrel.rotation.x = Math.PI / 2;
-    barrel.position.z = 2.2;
+    barrel.position.z = 2.2 * s;
     barrel.castShadow = true;
     this.turretPitch.add(barrel);
-    this.muzzle.position.set(0, 0, 4.4);
+    this.muzzle.position.set(0, 0, 4.4 * s);
     this.turretPitch.add(this.muzzle);
 
-    // legs
-    const legDefs: [number, number, number, number, number][] = [
-      // [hip x, hip z, rest x, rest z, tripod group]
-      [-3.2,  4.2, -6.0,  5.6, 0],
-      [ 3.2,  4.2,  6.0,  5.6, 1],
-      [-3.2,  0.0, -6.8,  0.0, 1],
-      [ 3.2,  0.0,  6.8,  0.0, 0],
-      [-3.2, -4.2, -6.0, -5.6, 0],
-      [ 3.2, -4.2,  6.0, -5.6, 1],
-    ];
-    for (const [hx, hz, rx, rz, grp] of legDefs) {
-      const hip = new THREE.Group();
-      hip.position.set(hx, -0.8, hz);
-      this.bodyRig.add(hip);
-      const upper = makeSeg(L1, 0.42, 0.3);
-      hip.add(upper);
-      const knee = new THREE.Group();
-      knee.position.y = L1;
-      upper.add(knee);
-      const lower = makeSeg(L2, 0.3, 0.16);
-      knee.add(lower);
-      const foot = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.75, 0.5, 8), mats.dark);
-      foot.castShadow = true;
-      scene.add(foot); // foot rendered in world space
+    // legs: legPairs rows of two, hips spread evenly along the hull
+    const rows = frame.legPairs;
+    const zMax = 4.2 * s;
+    for (let row = 0; row < rows; row++) {
+      const hz = rows === 1 ? 0 : zMax - (2 * zMax * row) / (rows - 1);
+      for (const side of [-1, 1]) {
+        const hip = new THREE.Group();
+        hip.position.set(3.2 * s * side, -0.8 * s, hz);
+        this.bodyRig.add(hip);
+        const upper = this.makeSeg(this.l1, 0.42 * legScale, 0.3 * legScale);
+        hip.add(upper);
+        const knee = new THREE.Group();
+        knee.position.y = this.l1;
+        upper.add(knee);
+        knee.add(this.makeSeg(this.l2, 0.3 * legScale, 0.16 * legScale));
+        const foot = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.55 * legScale, 0.75 * legScale, 0.5 * legScale, 8),
+          mats.dark);
+        foot.castShadow = true;
+        scene.add(foot); // foot rendered in world space
 
-      const side = Math.sign(rx) || 1;
-      this.legs.push({
-        hip, knee, footMesh: foot,
-        restLocal: new THREE.Vector3(rx, 0, rz),
-        poleLocal: new THREE.Vector3(side, 0.6, 0).normalize(),
-        grp,
-        footW: new THREE.Vector3(),
-        fromW: new THREE.Vector3(),
-        toW: new THREE.Vector3(),
-        stepT: 1,
-      });
+        this.legs.push({
+          hip, knee, footMesh: foot,
+          restLocal: new THREE.Vector3(6.4 * legScale * side, 0, hz * 1.33),
+          poleLocal: new THREE.Vector3(side, 0.6, 0).normalize(),
+          grp: (row + (side + 1) / 2) % 2,
+          footW: new THREE.Vector3(),
+          fromW: new THREE.Vector3(),
+          toW: new THREE.Vector3(),
+          stepT: 1,
+        });
+      }
     }
 
-    // initialise feet at rest positions
-    this.root.updateMatrixWorld(true);
-    for (const leg of this.legs) {
-      const w = leg.restLocal.clone().applyMatrix4(this.root.matrixWorld);
-      w.y = terrainH(w.x, w.z);
-      leg.footW.copy(w);
-    }
+    this.snapFeet();
+  }
+
+  private makeSeg(len: number, r0: number, r1: number): THREE.Mesh {
+    const g = new THREE.CylinderGeometry(r1, r0, len, 8);
+    g.translate(0, len / 2, 0); // pivot at base
+    const m = new THREE.Mesh(g, mats.leg);
+    m.castShadow = true;
+    return m;
   }
 
   get speedAbs(): number { return Math.abs(this.speed); }
@@ -160,8 +172,6 @@ export class Walker {
     this.scene.remove(this.root);
     for (const leg of this.legs) this.scene.remove(leg.footMesh);
   }
-
-  private steerAbs = 0;
 
   update(dt: number, throttle: number, steer: number): void {
     this.drive(dt, throttle, steer);
@@ -172,7 +182,7 @@ export class Walker {
   // (server/src/lib.rs::tick); keeping them identical makes client prediction
   // drift-free apart from input latency.
   drive(dt: number, throttle: number, steer: number): void {
-    this.speed += (throttle * MAXSPD - this.speed)
+    this.speed += (throttle * this.maxSpd - this.speed)
       * Math.min(1, ACCEL * dt / Math.max(1, Math.abs(this.speed)));
     if (!throttle) this.speed *= Math.pow(0.4, dt);
     this.yaw += steer * TURN * dt * (0.4 + 0.6 * Math.min(1, Math.abs(this.speed) / 3));
@@ -212,8 +222,7 @@ export class Walker {
     this.root.updateMatrixWorld();
 
     // world-space velocity, used to lead the feet in the direction of travel —
-    // works identically in reverse (this replaces the old sign-fudged z offset
-    // that led feet the wrong way when backing up)
+    // works identically in reverse
     _vel.set(Math.sin(this.yaw), 0, Math.cos(this.yaw)).multiplyScalar(this.speed);
 
     // --- gait ---
@@ -230,7 +239,7 @@ export class Walker {
         // planted — step when drifted too far, one tripod group at a time
         const err = leg.footW.distanceTo(_ideal);
         const groupTurn = (Math.floor(this.gaitPhase) % 2) === leg.grp;
-        if (err > STEP_TRIGGER && groupTurn) {
+        if (err > this.stepTrigger && groupTurn) {
           leg.fromW.copy(leg.footW);
           // land where the ideal spot will be at touchdown, not where it is now
           leg.toW.copy(_ideal).addScaledVector(_vel, STEP_DUR * 0.6);
@@ -254,18 +263,18 @@ export class Walker {
     let avgY = 0, foreY = 0, aftY = 0, leftY = 0, rightY = 0, nf = 0, na = 0, nl = 0, nr = 0;
     for (const leg of this.legs) {
       avgY += leg.footW.y;
-      if (leg.restLocal.z > 1) { foreY += leg.footW.y; nf++; }
-      if (leg.restLocal.z < -1) { aftY += leg.footW.y; na++; }
+      if (leg.restLocal.z > 0.5) { foreY += leg.footW.y; nf++; }
+      if (leg.restLocal.z < -0.5) { aftY += leg.footW.y; na++; }
       if (leg.restLocal.x < 0) { leftY += leg.footW.y; nl++; }
       else { rightY += leg.footW.y; nr++; }
     }
     avgY /= this.legs.length;
-    const pitch = Math.atan2(foreY / nf - aftY / na, 9) * 0.7;
-    const roll = Math.atan2(rightY / nr - leftY / nl, 7) * 0.7;
+    const pitch = nf && na ? Math.atan2(foreY / nf - aftY / na, 9) * 0.7 : 0;
+    const roll = nl && nr ? Math.atan2(rightY / nr - leftY / nl, 7) * 0.7 : 0;
 
     const bobY = Math.sin(this.gaitPhase * Math.PI * 2) * 0.12 * Math.min(1, activity / 4);
     const swayR = Math.sin(this.gaitPhase * Math.PI) * 0.015 * Math.min(1, activity / 4);
-    this.root.position.y = avgY + CLEARANCE + bobY;
+    this.root.position.y = avgY + this.clearance + bobY;
     this.bodyRig.rotation.x = THREE.MathUtils.lerp(
       this.bodyRig.rotation.x, pitch - this.recoil * 0.15, 0.1);
     this.bodyRig.rotation.z = THREE.MathUtils.lerp(
@@ -296,14 +305,14 @@ export class Walker {
   private solveLeg(leg: Leg): void {
     leg.hip.getWorldPosition(_hipW);
     _dir.copy(leg.footW).sub(_hipW);
-    const dist = Math.min(_dir.length(), L1 + L2 - 0.05);
+    const dist = Math.min(_dir.length(), this.l1 + this.l2 - 0.05);
     _dir.normalize();
 
     // law of cosines: hip lift angle + interior knee angle
     const a = Math.acos(THREE.MathUtils.clamp(
-      (L1 * L1 + dist * dist - L2 * L2) / (2 * L1 * dist), -1, 1));
+      (this.l1 * this.l1 + dist * dist - this.l2 * this.l2) / (2 * this.l1 * dist), -1, 1));
     const kneeAng = Math.acos(THREE.MathUtils.clamp(
-      (L1 * L1 + L2 * L2 - dist * dist) / (2 * L1 * L2), -1, 1));
+      (this.l1 * this.l1 + this.l2 * this.l2 - dist * dist) / (2 * this.l1 * this.l2), -1, 1));
 
     // Knee-flip fix: the bend plane is defined by a stable per-leg pole vector
     // (outward+up in walker space) instead of cross(dir, worldUp), which

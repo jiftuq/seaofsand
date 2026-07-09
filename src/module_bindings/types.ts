@@ -13,6 +13,7 @@ import {
 export const Player = __t.object("Player", {
   identity: __t.identity(),
   name: __t.string(),
+  roomId: __t.u64(),
   tramplerId: __t.option(__t.u64()),
   online: __t.bool(),
   localX: __t.f32(),
@@ -20,6 +21,15 @@ export const Player = __t.object("Player", {
   localZ: __t.f32(),
 });
 export type Player = __Infer<typeof Player>;
+
+export const Room = __t.object("Room", {
+  id: __t.u64(),
+  name: __t.string(),
+  host: __t.identity(),
+  createdAt: __t.timestamp(),
+  maxPlayers: __t.u32(),
+});
+export type Room = __Infer<typeof Room>;
 
 export const TickSchedule = __t.object("TickSchedule", {
   scheduledId: __t.u64(),
@@ -30,6 +40,7 @@ export type TickSchedule = __Infer<typeof TickSchedule>;
 export const Trampler = __t.object("Trampler", {
   id: __t.u64(),
   owner: __t.identity(),
+  roomId: __t.u64(),
   posX: __t.f32(),
   posY: __t.f32(),
   posZ: __t.f32(),
@@ -38,6 +49,7 @@ export const Trampler = __t.object("Trampler", {
   throttle: __t.f32(),
   steer: __t.f32(),
   frameId: __t.u32(),
+  color: __t.u32(),
   hpHull: __t.u16(),
   hpEngine: __t.u16(),
 });

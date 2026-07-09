@@ -1,14 +1,14 @@
-// SpacetimeDB client glue (M2).
+// SpacetimeDB client glue.
 //
 // Contract (see docs/HANDOFF.md):
 // - Server is authoritative over trampler kinematics; it syncs pos/yaw/speed
 //   only. Leg IK and gait are NEVER networked — clients derive them locally.
 // - Remote trampler poses are interpolated over a ~120ms buffer.
-// - Players aboard a trampler sync in trampler-local coordinates (local_pos),
-//   never world space (schema field exists; used from M4 deck movement on).
+// - Rooms: room + player tables are subscribed globally (they're tiny);
+//   tramplers are subscribed per-room so rooms never see each other's traffic.
 
 import { Identity } from 'spacetimedb';
-import { DbConnection } from './module_bindings';
+import { DbConnection, type SubscriptionHandle } from './module_bindings';
 
 export interface PoseSnapshot {
   t: number; // local receive time, ms (performance.now())
@@ -21,7 +21,16 @@ export interface PoseSnapshot {
 
 export interface RemoteTrampler {
   id: bigint;
+  frameId: number;
+  color: number;
   buffer: PoseSnapshot[];
+}
+
+export interface RoomInfo {
+  id: bigint;
+  name: string;
+  maxPlayers: number;
+  players: number; // online players currently in the room
 }
 
 const INTERP_DELAY_MS = 120;
@@ -38,20 +47,27 @@ function lerpAngle(a: number, b: number, t: number): number {
 export class Net {
   private conn: DbConnection | null = null;
   private identity: Identity | null = null;
+  private tramplerSub: SubscriptionHandle | null = null;
   private lastInputSent = 0;
   private lastThrottle = NaN;
   private lastSteer = NaN;
 
   connected = false;
+  roomId = 1n; // room 1 = open desert, where every player starts
   /** Own trampler's latest server state (reconciliation target). */
-  ownState: PoseSnapshot & { id: bigint } | null = null;
-  /** Everyone else's tramplers, keyed by id, with interpolation buffers. */
+  ownState: (PoseSnapshot & { id: bigint; frameId: number; color: number }) | null = null;
+  /** Everyone else's tramplers in this room, keyed by id. */
   remotes = new Map<bigint, RemoteTrampler>();
 
   onStatus?: (text: string) => void;
-  /** Fired once when the server first assigns us a trampler (spawn point). */
-  onOwnSpawn?: (snap: PoseSnapshot) => void;
+  /** Fired when the server assigns us a (new) trampler. */
+  onOwnSpawn?: (snap: PoseSnapshot, frameId: number, color: number) => void;
+  onOwnDespawn?: () => void;
   onRemoteGone?: (id: bigint) => void;
+  /** Fired whenever the room list or player counts change. */
+  onRoomsChanged?: (rooms: RoomInfo[]) => void;
+  /** Fired after our player row lands in a different room. */
+  onRoomChanged?: (roomId: bigint) => void;
 
   connect(uri: string, dbName: string, playerName: string): void {
     try {
@@ -79,13 +95,11 @@ export class Net {
           .onApplied(() => {
             this.onStatus?.('synced');
             void conn.reducers.join({ name: playerName });
-            conn.reducers.spawnTrampler({ frameId: 0 }).catch(() => {
-              /* already own one — fine, we'll pick it up from the table */
-            });
-            // pick up rows that were already in the cache before callbacks ran
-            for (const row of conn.db.trampler.iter()) this.ingest(row);
+            this.emitRooms();
           })
-          .subscribe('SELECT * FROM trampler');
+          .subscribe('SELECT * FROM room');
+        conn.subscriptionBuilder().subscribe('SELECT * FROM player');
+        this.subscribeRoomTramplers();
       })
       .onConnectError((_ctx, err) => {
         this.connected = false;
@@ -98,17 +112,73 @@ export class Net {
       .build();
   }
 
+  private subscribeRoomTramplers(): void {
+    if (!this.conn) return;
+    this.tramplerSub?.unsubscribe();
+    // drop everything from the previous room
+    for (const id of [...this.remotes.keys()]) {
+      this.remotes.delete(id);
+      this.onRemoteGone?.(id);
+    }
+    if (this.ownState) {
+      this.ownState = null;
+      this.onOwnDespawn?.();
+    }
+    this.tramplerSub = this.conn.subscriptionBuilder()
+      .onApplied(() => {
+        for (const row of this.conn!.db.trampler.iter()) this.ingest(row);
+      })
+      .subscribe(`SELECT * FROM trampler WHERE room_id = ${this.roomId}`);
+  }
+
   private registerTableCallbacks(conn: DbConnection): void {
     conn.db.trampler.onInsert((_ctx, row) => this.ingest(row));
     conn.db.trampler.onUpdate((_ctx, _old, row) => this.ingest(row));
     conn.db.trampler.onDelete((_ctx, row) => {
-      this.remotes.delete(row.id);
-      this.onRemoteGone?.(row.id);
+      if (this.ownState && row.id === this.ownState.id) {
+        this.ownState = null;
+        this.onOwnDespawn?.();
+        return;
+      }
+      if (this.remotes.delete(row.id)) this.onRemoteGone?.(row.id);
     });
+
+    const roomsChanged = () => this.emitRooms();
+    conn.db.room.onInsert(roomsChanged);
+    conn.db.room.onDelete(roomsChanged);
+    conn.db.player.onDelete(roomsChanged);
+    const onOwnRow = (row: { identity: Identity; roomId: bigint }) => {
+      if (this.identity && row.identity.isEqual(this.identity)
+          && row.roomId !== this.roomId) {
+        this.roomId = row.roomId;
+        this.subscribeRoomTramplers();
+        this.onRoomChanged?.(row.roomId);
+      }
+      this.emitRooms();
+    };
+    conn.db.player.onInsert((_ctx, row) => onOwnRow(row));
+    conn.db.player.onUpdate((_ctx, _old, row) => onOwnRow(row));
+  }
+
+  private emitRooms(): void {
+    if (!this.conn || !this.onRoomsChanged) return;
+    const counts = new Map<bigint, number>();
+    for (const p of this.conn.db.player.iter()) {
+      if (p.online) counts.set(p.roomId, (counts.get(p.roomId) ?? 0) + 1);
+    }
+    const rooms: RoomInfo[] = [...this.conn.db.room.iter()]
+      .map(r => ({
+        id: r.id,
+        name: r.name,
+        maxPlayers: r.maxPlayers,
+        players: counts.get(r.id) ?? 0,
+      }))
+      .sort((a, b) => (a.id < b.id ? -1 : 1));
+    this.onRoomsChanged(rooms);
   }
 
   private ingest(row: {
-    id: bigint; owner: Identity;
+    id: bigint; owner: Identity; frameId: number; color: number;
     posX: number; posY: number; posZ: number; yaw: number; speed: number;
   }): void {
     const snap: PoseSnapshot = {
@@ -117,14 +187,14 @@ export class Net {
       yaw: row.yaw, speed: row.speed,
     };
     if (this.identity && row.owner.isEqual(this.identity)) {
-      const first = this.ownState === null;
-      this.ownState = { ...snap, id: row.id };
-      if (first) this.onOwnSpawn?.(snap);
+      const isNew = this.ownState === null || this.ownState.id !== row.id;
+      this.ownState = { ...snap, id: row.id, frameId: row.frameId, color: row.color };
+      if (isNew) this.onOwnSpawn?.(snap, row.frameId, row.color);
       return;
     }
     let r = this.remotes.get(row.id);
     if (!r) {
-      r = { id: row.id, buffer: [] };
+      r = { id: row.id, frameId: row.frameId, color: row.color, buffer: [] };
       this.remotes.set(row.id, r);
     }
     r.buffer.push(snap);
@@ -158,7 +228,7 @@ export class Net {
 
   /** Rate-limited, change-deduplicated input send. */
   sendInput(throttle: number, steer: number, now: number): void {
-    if (!this.conn || !this.connected) return;
+    if (!this.conn || !this.connected || !this.ownState) return;
     const changed = throttle !== this.lastThrottle || steer !== this.lastSteer;
     const due = now - this.lastInputSent > 1000 / INPUT_SEND_HZ;
     if (!changed && !due) return;
@@ -167,5 +237,20 @@ export class Net {
     this.lastSteer = steer;
     this.lastInputSent = now;
     this.conn.reducers.setInput({ throttle, steer }).catch(() => {});
+  }
+
+  spawn(frameId: number, color: number): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.spawnTrampler({ frameId, color });
+  }
+
+  createRoom(name: string): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.createRoom({ name });
+  }
+
+  joinRoom(roomId: bigint): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.joinRoom({ roomId });
   }
 }
