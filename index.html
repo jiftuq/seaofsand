@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SEA OF SAND — trampler test</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#0c0c0e;font-family:'Courier New',monospace}
+  #hud{position:fixed;top:12px;left:12px;color:#e8b04a;font-size:12px;line-height:1.7;
+    text-shadow:0 0 6px rgba(232,176,74,.35);pointer-events:none;user-select:none}
+  #hud b{color:#fff}
+  #crosshair{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);color:#e8b04a;
+    font-size:18px;pointer-events:none;opacity:.8}
+  #msg{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);color:#e8b04a;
+    font-size:13px;letter-spacing:2px;pointer-events:none;opacity:0;transition:opacity .5s}
+</style>
+</head>
+<body>
+<div id="hud">
+  <b>TRAMPLER Mk.I</b> — Sophie surface test<br>
+  W/S throttle &nbsp; A/D steer &nbsp; MOUSE aim &nbsp; CLICK fire<br>
+  speed: <span id="spd">0.0</span> m/s &nbsp; heading: <span id="hdg">0</span>°<br>
+  <span id="target">derelict integrity: 100%</span>
+</div>
+<div id="crosshair">+</div>
+<div id="msg"></div>
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

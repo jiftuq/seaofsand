@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TRAMPLER — walker prototype</title>
+<style>
+  html,body{margin:0;padding:0;overflow:hidden;background:#0c0c0e;font-family:'Courier New',monospace}
+  #hud{position:fixed;top:12px;left:12px;color:#e8b04a;font-size:12px;line-height:1.7;
+    text-shadow:0 0 6px rgba(232,176,74,.35);pointer-events:none;user-select:none}
+  #hud b{color:#fff}
+  #crosshair{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);color:#e8b04a;
+    font-size:18px;pointer-events:none;opacity:.8}
+  #msg{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);color:#e8b04a;
+    font-size:13px;letter-spacing:2px;pointer-events:none;opacity:0;transition:opacity .5s}
+</style>
+</head>
+<body>
+<div id="hud">
+  <b>TRAMPLER Mk.I</b> — Sophie surface test<br>
+  W/S throttle &nbsp; A/D steer &nbsp; MOUSE aim &nbsp; CLICK fire<br>
+  speed: <span id="spd">0.0</span> m/s &nbsp; heading: <span id="hdg">0</span>°<br>
+  <span id="target">derelict integrity: 100%</span>
+</div>
+<div id="crosshair">+</div>
+<div id="msg"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* =========================================================
+   TRAMPLER PROTOTYPE
+   - analytic dune heightfield (legs sample it directly)
+   - 6-leg two-bone IK walker, tripod gait
+   - body height/pitch/roll derived from feet
+   - turret + ballistic cannon + destructible derelict
+   ========================================================= */
+
+// ---------- scene ----------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0xd8a86b);
+scene.fog = new THREE.FogExp2(0xd8a86b, 0.0038);
+
+const camera = new THREE.PerspectiveCamera(62, innerWidth/innerHeight, 0.1, 2000);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const sun = new THREE.DirectionalLight(0xffe6c0, 1.35);
+sun.position.set(120, 180, 60);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -80; sun.shadow.camera.right = 80;
+sun.shadow.camera.top = 80; sun.shadow.camera.bottom = -80;
+sun.shadow.camera.far = 500;
+scene.add(sun);
+scene.add(new THREE.HemisphereLight(0xf2c98a, 0x6b4a2a, 0.55));
+
+// ---------- terrain (analytic — same fn drives mesh + feet) ----------
+function terrainH(x, z){
+  return Math.sin(x*0.018)*Math.cos(z*0.022)*7
+       + Math.sin(x*0.05 + z*0.03)*2.4
+       + Math.sin(x*0.11)*Math.sin(z*0.13)*0.8;
+}
+const TSIZE = 900, TSEG = 180;
+const tGeo = new THREE.PlaneGeometry(TSIZE, TSIZE, TSEG, TSEG);
+tGeo.rotateX(-Math.PI/2);
+{
+  const p = tGeo.attributes.position;
+  for(let i=0;i<p.count;i++) p.setY(i, terrainH(p.getX(i), p.getZ(i)));
+  tGeo.computeVertexNormals();
+}
+const terrain = new THREE.Mesh(tGeo, new THREE.MeshStandardMaterial({
+  color:0xc9975a, roughness:1, metalness:0, flatShading:false
+}));
+terrain.receiveShadow = true;
+scene.add(terrain);
+
+// scattered rocks
+const rockGeo = new THREE.DodecahedronGeometry(1, 0);
+const rockMat = new THREE.MeshStandardMaterial({color:0x8a6a48, roughness:1});
+for(let i=0;i<120;i++){
+  const r = new THREE.Mesh(rockGeo, rockMat);
+  const x = (Math.random()-0.5)*TSIZE*0.9, z = (Math.random()-0.5)*TSIZE*0.9;
+  r.position.set(x, terrainH(x,z)+0.2, z);
+  const s = 0.5+Math.random()*2.5;
+  r.scale.set(s, s*0.7, s);
+  r.rotation.y = Math.random()*Math.PI;
+  r.castShadow = true;
+  scene.add(r);
+}
+
+// ---------- trampler ----------
+const mats = {
+  hull:  new THREE.MeshStandardMaterial({color:0x5a4a3a, roughness:.85, metalness:.35}),
+  dark:  new THREE.MeshStandardMaterial({color:0x2e2a26, roughness:.9,  metalness:.3}),
+  brass: new THREE.MeshStandardMaterial({color:0xb08840, roughness:.5,  metalness:.7}),
+  leg:   new THREE.MeshStandardMaterial({color:0x3d3833, roughness:.8,  metalness:.4})
+};
+
+const trampler = new THREE.Group();          // world transform (yaw + position)
+const bodyRig  = new THREE.Group();          // pitch/roll/bob relative to trampler
+trampler.add(bodyRig);
+scene.add(trampler);
+
+// hull
+function box(w,h,d,m,x=0,y=0,z=0,parent=bodyRig){
+  const b = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), m);
+  b.position.set(x,y,z); b.castShadow = true; parent.add(b); return b;
+}
+box(6, 3.2, 11, mats.hull, 0, 0, 0);                 // main hull
+box(6.6, 0.4, 11.6, mats.dark, 0, 1.8, 0);           // deck rim
+box(3.4, 2.2, 3.6, mats.dark, 0, 2.9, -3.2);         // wheelhouse aft
+box(0.7, 3.5, 0.7, mats.brass, 2.2, 3.6, -4.6);      // smokestack
+const stackTip = box(0.9, 0.3, 0.9, mats.dark, 2.2, 5.4, -4.6);
+
+// turret (yaw ring + pitching barrel)
+const turretYaw = new THREE.Group(); turretYaw.position.set(0, 2.2, 2.8); bodyRig.add(turretYaw);
+box(1.8, 0.9, 1.8, mats.brass, 0, 0, 0, turretYaw);
+const turretPitch = new THREE.Group(); turretPitch.position.set(0, 0.5, 0); turretYaw.add(turretPitch);
+const barrel = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.28, 4.4, 10), mats.dark);
+barrel.rotation.x = Math.PI/2; barrel.position.z = 2.2; barrel.castShadow = true;
+turretPitch.add(barrel);
+const muzzle = new THREE.Object3D(); muzzle.position.set(0, 0, 4.4); turretPitch.add(muzzle);
+
+// ---------- legs: 6x two-bone IK, tripod gait ----------
+const L1 = 5.2, L2 = 5.8;                 // upper/lower segment lengths
+const CLEARANCE = 6.2;                    // hull height above avg foot
+const legs = [];
+const legDefs = [ // [hip x, hip z, rest x, rest z, tripod group]
+  [-3.2, 4.2,  -6.0,  5.6, 0],
+  [ 3.2, 4.2,   6.0,  5.6, 1],
+  [-3.2, 0.0,  -6.8,  0.0, 1],
+  [ 3.2, 0.0,   6.8,  0.0, 0],
+  [-3.2,-4.2,  -6.0, -5.6, 0],
+  [ 3.2,-4.2,   6.0, -5.6, 1],
+];
+
+function makeSeg(len, r0, r1){
+  const g = new THREE.CylinderGeometry(r1, r0, len, 8);
+  g.translate(0, len/2, 0);              // pivot at base
+  const m = new THREE.Mesh(g, mats.leg);
+  m.castShadow = true; return m;
+}
+
+for(const [hx, hz, rx, rz, grp] of legDefs){
+  const hip = new THREE.Group();
+  hip.position.set(hx, -0.8, hz);
+  bodyRig.add(hip);
+  const upper = makeSeg(L1, 0.42, 0.3); hip.add(upper);
+  const knee = new THREE.Group(); knee.position.y = L1; upper.add(knee);
+  const lower = makeSeg(L2, 0.3, 0.16); knee.add(lower);
+  const foot = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.75, 0.5, 8), mats.dark);
+  foot.castShadow = true; scene.add(foot); // foot rendered in world space
+
+  legs.push({
+    hip, upper, knee, lower, footMesh: foot,
+    restLocal: new THREE.Vector3(rx, 0, rz),   // ideal foot pos in trampler space
+    grp,
+    footW: new THREE.Vector3(),                // current planted foot (world)
+    fromW: new THREE.Vector3(),                // step start
+    toW:   new THREE.Vector3(),                // step end
+    stepT: 1,                                  // 1 = planted
+  });
+}
+
+// initialise feet at rest positions
+trampler.position.set(0, 0, 0);
+for(const leg of legs){
+  const w = leg.restLocal.clone().applyMatrix4(trampler.matrixWorld);
+  w.y = terrainH(w.x, w.z);
+  leg.footW.copy(w);
+}
+
+// ---------- derelict target ----------
+const derelict = new THREE.Group();
+{
+  const dx = 60, dz = -40;
+  derelict.position.set(dx, terrainH(dx,dz), dz);
+  const m = new THREE.MeshStandardMaterial({color:0x4a4640, roughness:.95, metalness:.4});
+  const hull = new THREE.Mesh(new THREE.BoxGeometry(7, 4, 14), m);
+  hull.position.y = 3; hull.rotation.z = 0.28; hull.castShadow = true;
+  derelict.add(hull);
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(.3,.4,9,8), m);
+  mast.position.set(1, 7, -2); mast.rotation.z = .35; mast.castShadow = true;
+  derelict.add(mast);
+  scene.add(derelict);
+}
+let derelictHP = 100;
+
+// ---------- projectiles & particles ----------
+const projectiles = [];
+const projGeo = new THREE.SphereGeometry(0.25, 8, 8);
+const projMat = new THREE.MeshBasicMaterial({color:0xffd080});
+
+const particles = [];
+const dustGeo = new THREE.SphereGeometry(0.3, 6, 6);
+const dustMat = new THREE.MeshBasicMaterial({color:0xd8b078, transparent:true});
+const fireMat = new THREE.MeshBasicMaterial({color:0xff7a2a, transparent:true});
+
+function spawnBurst(pos, n, mat, spread, up){
+  for(let i=0;i<n;i++){
+    const p = new THREE.Mesh(dustGeo, mat.clone());
+    p.position.copy(pos);
+    p.userData.v = new THREE.Vector3(
+      (Math.random()-.5)*spread, Math.random()*up, (Math.random()-.5)*spread);
+    p.userData.life = 0.6 + Math.random()*0.6;
+    p.userData.t = 0;
+    const s = 0.5 + Math.random();
+    p.scale.set(s,s,s);
+    scene.add(p); particles.push(p);
+  }
+}
+
+// simple audio thud
+const AC = window.AudioContext ? new AudioContext() : null;
+function thud(freq, dur, gain){
+  if(!AC) return;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.frequency.value = freq; o.type = 'triangle';
+  g.gain.setValueAtTime(gain, AC.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+  o.connect(g).connect(AC.destination);
+  o.start(); o.stop(AC.currentTime + dur);
+}
+
+// ---------- input ----------
+const keys = {};
+addEventListener('keydown', e => keys[e.code] = true);
+addEventListener('keyup',   e => keys[e.code] = false);
+let mouseX = 0, mouseY = 0;
+addEventListener('mousemove', e => {
+  mouseX = (e.clientX/innerWidth)*2 - 1;
+  mouseY = (e.clientY/innerHeight)*2 - 1;
+});
+let fireCooldown = 0;
+addEventListener('mousedown', () => {
+  if(AC && AC.state === 'suspended') AC.resume();
+  if(fireCooldown > 0) return;
+  fireCooldown = 0.9;
+  const pos = new THREE.Vector3(); muzzle.getWorldPosition(pos);
+  const dir = new THREE.Vector3(0,0,1)
+    .applyQuaternion(turretPitch.getWorldQuaternion(new THREE.Quaternion()));
+  const p = new THREE.Mesh(projGeo, projMat);
+  p.position.copy(pos);
+  p.userData.v = dir.multiplyScalar(70);
+  scene.add(p); projectiles.push(p);
+  spawnBurst(pos, 6, fireMat, 3, 2);
+  thud(70, 0.35, 0.5);
+  recoil = 0.25;
+});
+
+// ---------- state ----------
+let speed = 0, yaw = 0, recoil = 0, gaitPhase = 0, smokeT = 0;
+const MAXSPD = 9, ACCEL = 6, TURN = 0.7;
+const msgEl = document.getElementById('msg');
+function flash(t){ msgEl.textContent = t; msgEl.style.opacity = 1;
+  setTimeout(()=>msgEl.style.opacity = 0, 2200); }
+
+// ---------- IK solve for one leg ----------
+const _v = new THREE.Vector3(), _q = new THREE.Quaternion();
+function solveLeg(leg){
+  // hip world position
+  leg.hip.getWorldPosition(_v);
+  const target = leg.footW;
+  const dx = target.x - _v.x, dy = target.y - _v.y, dz = target.z - _v.z;
+  let dist = Math.sqrt(dx*dx + dy*dy + dz*dz);
+  dist = Math.min(dist, L1 + L2 - 0.05);
+
+  // hip aims its +Y down toward the target, then knee bends in-plane
+  // angle from straight line for upper segment (law of cosines)
+  const a = Math.acos(THREE.MathUtils.clamp(
+    (L1*L1 + dist*dist - L2*L2) / (2*L1*dist), -1, 1));
+  const kneeAng = Math.acos(THREE.MathUtils.clamp(
+    (L1*L1 + L2*L2 - dist*dist) / (2*L1*L2), -1, 1));
+
+  // orient hip: +Y toward target dir, rotated back by `a` around the bend axis
+  const dir = new THREE.Vector3(dx,dy,dz).normalize();
+  // bend axis: horizontal, perpendicular to leg direction, pointing so knee goes outward/up
+  const side = Math.sign(leg.restLocal.x) || 1;
+  const bendAxis = new THREE.Vector3().crossVectors(dir, new THREE.Vector3(0,1,0));
+  if(bendAxis.lengthSq() < 1e-6) bendAxis.set(side,0,0);
+  bendAxis.normalize();
+
+  const baseQ = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0), dir);
+  const liftQ = new THREE.Quaternion().setFromAxisAngle(bendAxis, -a);
+  const worldQ = liftQ.multiply(baseQ);
+  // convert to hip local (hip parent is bodyRig)
+  leg.hip.parent.getWorldQuaternion(_q);
+  leg.hip.quaternion.copy(_q.invert().multiply(worldQ));
+
+  leg.knee.rotation.x = Math.PI - kneeAng;
+
+  leg.footMesh.position.copy(target);
+  leg.footMesh.position.y += 0.25;
+}
+
+// ---------- main loop ----------
+const clock = new THREE.Clock();
+const spdEl = document.getElementById('spd');
+const hdgEl = document.getElementById('hdg');
+const tgtEl = document.getElementById('target');
+
+function animate(){
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  fireCooldown = Math.max(0, fireCooldown - dt);
+  recoil = Math.max(0, recoil - dt*1.2);
+
+  // --- drive ---
+  const throttle = (keys['KeyW']?1:0) - (keys['KeyS']?0.5:0);
+  speed += (throttle*MAXSPD - speed) * Math.min(1, ACCEL*dt/Math.max(1,Math.abs(speed)));
+  if(!throttle) speed *= Math.pow(0.4, dt);
+  const steer = (keys['KeyA']?1:0) - (keys['KeyD']?1:0);
+  yaw += steer * TURN * dt * (0.4 + 0.6*Math.min(1, Math.abs(speed)/3));
+  trampler.rotation.y = yaw;
+  trampler.position.x -= Math.sin(yaw) * -speed * dt;
+  trampler.position.z -= Math.cos(yaw) * speed * dt * -1;
+  // (forward is -Z... keep it simple:)
+  // recompute cleanly:
+  // NOTE: forward vector
+  // ---
+  trampler.updateMatrixWorld();
+
+  // --- gait ---
+  const speedAbs = Math.abs(speed) + Math.abs(steer)*2;
+  gaitPhase += dt * (0.5 + speedAbs*0.35);
+
+  const stepDur = 0.32;
+  for(const leg of legs){
+    // desired foot position: rest pose + velocity lead
+    const ideal = leg.restLocal.clone();
+    ideal.z += Math.sign(speed) * Math.min(2.2, Math.abs(speed)*0.28);
+    ideal.applyMatrix4(trampler.matrixWorld);
+    ideal.y = terrainH(ideal.x, ideal.z);
+
+    if(leg.stepT >= 1){
+      // planted — check if we need to step
+      const err = leg.footW.distanceTo(ideal);
+      // only one tripod group steps at a time
+      const groupTurn = (Math.floor(gaitPhase) % 2) === leg.grp;
+      if(err > 2.2 && groupTurn){
+        leg.fromW.copy(leg.footW);
+        leg.toW.copy(ideal);
+        leg.stepT = 0;
+      }
+    } else {
+      leg.stepT = Math.min(1, leg.stepT + dt/stepDur);
+      const t = leg.stepT, ease = t*t*(3-2*t);
+      leg.footW.lerpVectors(leg.fromW, leg.toW, ease);
+      leg.footW.y = THREE.MathUtils.lerp(leg.fromW.y, leg.toW.y, ease)
+                  + Math.sin(t*Math.PI) * 1.6;               // lift arc
+      if(leg.stepT >= 1){
+        leg.footW.y = terrainH(leg.footW.x, leg.footW.z);
+        spawnBurst(leg.footW, 3, dustMat, 2, 1.2);
+        thud(45 + Math.random()*15, 0.18, 0.12);
+      }
+    }
+  }
+
+  // --- body height / pitch / roll from feet ---
+  let avgY = 0, foreY = 0, aftY = 0, leftY = 0, rightY = 0, nf=0, na=0, nl=0, nr=0;
+  for(const leg of legs){
+    avgY += leg.footW.y;
+    if(leg.restLocal.z > 1){ foreY += leg.footW.y; nf++; }
+    if(leg.restLocal.z < -1){ aftY += leg.footW.y; na++; }
+    if(leg.restLocal.x < 0){ leftY += leg.footW.y; nl++; }
+    else { rightY += leg.footW.y; nr++; }
+  }
+  avgY /= legs.length;
+  const pitch = Math.atan2((foreY/nf - aftY/na), 9) * 0.7;
+  const roll  = Math.atan2((rightY/nr - leftY/nl), 7) * 0.7;
+
+  const bobY = Math.sin(gaitPhase * Math.PI * 2) * 0.12 * Math.min(1, speedAbs/4);
+  const swayR = Math.sin(gaitPhase * Math.PI) * 0.015 * Math.min(1, speedAbs/4);
+  trampler.position.y = avgY + CLEARANCE + bobY;
+  bodyRig.rotation.x = THREE.MathUtils.lerp(bodyRig.rotation.x, pitch - recoil*0.15, 0.1);
+  bodyRig.rotation.z = THREE.MathUtils.lerp(bodyRig.rotation.z, roll + swayR, 0.1);
+
+  // solve IK after body settled
+  trampler.updateMatrixWorld();
+  for(const leg of legs) solveLeg(leg);
+
+  // --- smokestack puffs ---
+  smokeT -= dt;
+  if(smokeT < 0 && speedAbs > 0.5){
+    smokeT = 0.25;
+    const sp = new THREE.Vector3(); stackTip.getWorldPosition(sp);
+    spawnBurst(sp, 1, new THREE.MeshBasicMaterial({color:0x555049, transparent:true}), 0.5, 3);
+  }
+
+  // --- turret aim (mouse) ---
+  turretYaw.rotation.y = THREE.MathUtils.lerp(turretYaw.rotation.y, -mouseX*1.6, 0.12);
+  turretPitch.rotation.x = THREE.MathUtils.lerp(turretPitch.rotation.x,
+    THREE.MathUtils.clamp(mouseY*0.7 - 0.08, -0.5, 0.35), 0.12);
+
+  // --- projectiles ---
+  for(let i=projectiles.length-1;i>=0;i--){
+    const p = projectiles[i];
+    p.userData.v.y -= 22*dt;
+    p.position.addScaledVector(p.userData.v, dt);
+    const groundY = terrainH(p.position.x, p.position.z);
+    let hit = p.position.y <= groundY;
+    // derelict hit (crude sphere test)
+    if(!hit && derelictHP > 0 && p.position.distanceTo(
+        derelict.position.clone().add(new THREE.Vector3(0,4,0))) < 7){
+      hit = true;
+      derelictHP = Math.max(0, derelictHP - 12);
+      tgtEl.textContent = 'derelict integrity: ' + derelictHP + '%';
+      if(derelictHP === 0){
+        flash('DERELICT DESTROYED — LOOT SECURED');
+        derelict.children.forEach(c => { c.material = c.material.clone(); c.material.color.set(0x1a1815); });
+        derelict.rotation.z = 0.5;
+        spawnBurst(derelict.position.clone().add(new THREE.Vector3(0,4,0)), 30, fireMat, 10, 8);
+        thud(35, 1.2, 0.8);
+      }
+    }
+    if(hit){
+      spawnBurst(p.position, 12, fireMat, 6, 4);
+      spawnBurst(p.position, 8, dustMat, 5, 3);
+      thud(50, 0.5, 0.4);
+      scene.remove(p); projectiles.splice(i,1);
+    } else if(p.position.length() > 1200){
+      scene.remove(p); projectiles.splice(i,1);
+    }
+  }
+
+  // --- particles ---
+  for(let i=particles.length-1;i>=0;i--){
+    const p = particles[i];
+    p.userData.t += dt;
+    p.userData.v.y -= 3*dt;
+    p.position.addScaledVector(p.userData.v, dt);
+    const k = p.userData.t / p.userData.life;
+    p.material.opacity = Math.max(0, 1-k);
+    p.scale.multiplyScalar(1 + dt*1.5);
+    if(k >= 1){ scene.remove(p); particles.splice(i,1); }
+  }
+
+  // --- camera: third person chase ---
+  const camOff = new THREE.Vector3(0, 9, -20).applyAxisAngle(new THREE.Vector3(0,1,0), yaw);
+  const camTarget = trampler.position.clone().add(camOff);
+  camTarget.y = Math.max(camTarget.y, terrainH(camTarget.x, camTarget.z) + 3);
+  camera.position.lerp(camTarget, 0.06);
+  const look = trampler.position.clone().add(new THREE.Vector3(0,3,0));
+  camera.lookAt(look);
+
+  // --- hud ---
+  spdEl.textContent = Math.abs(speed).toFixed(1);
+  hdgEl.textContent = ((yaw*180/Math.PI)%360|0);
+
+  renderer.render(scene, camera);
+}
+
+// fix movement direction: recompute in-loop above used a muddled sign; correct here by
+// overriding with a clean integrator each frame via monkey-patched values is messy —
+// instead we define forward properly once:
+(function fixForward(){
+  // replace the two movement lines' effect: zero them out by resetting each frame is
+  // not possible post-hoc; movement above already applies:
+  //   x -= sin(yaw) * -speed*dt  => x += sin(yaw)*speed*dt
+  //   z -= cos(yaw) * speed*dt * -1 => z += cos(yaw)*speed*dt
+  // net: forward = (+sin(yaw), +cos(yaw)) which is +Z at yaw=0 — matches turret facing +Z. OK.
+})();
+
+flash('SYSTEMS ONLINE — ENGAGE THROTTLE');
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
