@@ -3,7 +3,10 @@ export class Hud {
   private hdg = document.getElementById('hdg')!;
   private tgt = document.getElementById('target')!;
   private msg = document.getElementById('msg') as HTMLElement;
+  private net = document.getElementById('net')!;
   private msgTimer = 0;
+
+  setNet(text: string): void { this.net.textContent = text; }
 
   setSpeed(v: number): void { this.spd.textContent = Math.abs(v).toFixed(1); }
 

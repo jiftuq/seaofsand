@@ -6,9 +6,12 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "server:publish": "cd server && spacetime publish --server http://localhost:3000 seaofsand",
+    "server:generate": "spacetime generate --lang typescript --out-dir src/module_bindings --module-path server"
   },
   "dependencies": {
+    "spacetimedb": "^2.6.1",
     "three": "^0.166.0"
   },
   "devDependencies": {

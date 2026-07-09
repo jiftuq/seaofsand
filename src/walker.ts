@@ -82,7 +82,7 @@ export class Walker {
   private smokeT = 0;
   onSmokePuff?: (pos: THREE.Vector3) => void;
 
-  constructor(scene: THREE.Scene) {
+  constructor(private scene: THREE.Scene) {
     this.root.add(this.bodyRig);
     scene.add(this.root);
 
@@ -156,18 +156,59 @@ export class Walker {
 
   get speedAbs(): number { return Math.abs(this.speed); }
 
-  update(dt: number, throttle: number, steer: number): void {
-    this.recoil = Math.max(0, this.recoil - dt * 1.2);
+  dispose(): void {
+    this.scene.remove(this.root);
+    for (const leg of this.legs) this.scene.remove(leg.footMesh);
+  }
 
-    // --- drive ---
+  private steerAbs = 0;
+
+  update(dt: number, throttle: number, steer: number): void {
+    this.drive(dt, throttle, steer);
+    this.animate(dt);
+  }
+
+  // Local drive integrator. The server runs this exact same math on tick
+  // (server/src/lib.rs::tick); keeping them identical makes client prediction
+  // drift-free apart from input latency.
+  drive(dt: number, throttle: number, steer: number): void {
     this.speed += (throttle * MAXSPD - this.speed)
       * Math.min(1, ACCEL * dt / Math.max(1, Math.abs(this.speed)));
     if (!throttle) this.speed *= Math.pow(0.4, dt);
     this.yaw += steer * TURN * dt * (0.4 + 0.6 * Math.min(1, Math.abs(this.speed) / 3));
-    this.root.rotation.y = this.yaw;
     // forward is +Z at yaw=0 (matches turret facing); clean single integrator
     this.root.position.x += Math.sin(this.yaw) * this.speed * dt;
     this.root.position.z += Math.cos(this.yaw) * this.speed * dt;
+    this.steerAbs = Math.abs(steer);
+  }
+
+  // Pose a remote (or reconciled) walker from networked pos/yaw/speed; gait
+  // and IK derive from these in animate() — leg state is never networked.
+  setPose(x: number, z: number, yaw: number, speed: number): void {
+    this.root.position.x = x;
+    this.root.position.z = z;
+    this.yaw = yaw;
+    this.speed = speed;
+    this.steerAbs = 0;
+  }
+
+  // Re-plant every foot at its rest position. Call after teleporting (spawn,
+  // large server correction) so legs don't drag across the map.
+  snapFeet(): void {
+    this.root.rotation.y = this.yaw;
+    this.root.updateMatrixWorld(true);
+    for (const leg of this.legs) {
+      const w = leg.restLocal.clone().applyMatrix4(this.root.matrixWorld);
+      w.y = terrainH(w.x, w.z);
+      leg.footW.copy(w);
+      leg.stepT = 1;
+    }
+  }
+
+  // Everything cosmetic: gait, stepping, body attitude, IK, smoke.
+  animate(dt: number): void {
+    this.recoil = Math.max(0, this.recoil - dt * 1.2);
+    this.root.rotation.y = this.yaw;
     this.root.updateMatrixWorld();
 
     // world-space velocity, used to lead the feet in the direction of travel —
@@ -176,7 +217,7 @@ export class Walker {
     _vel.set(Math.sin(this.yaw), 0, Math.cos(this.yaw)).multiplyScalar(this.speed);
 
     // --- gait ---
-    const activity = Math.abs(this.speed) + Math.abs(steer) * 2;
+    const activity = Math.abs(this.speed) + this.steerAbs * 2;
     this.gaitPhase += dt * (0.5 + activity * 0.35);
 
     for (const leg of this.legs) {
