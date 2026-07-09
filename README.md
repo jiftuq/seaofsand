@@ -33,10 +33,19 @@ npm run server:publish         # build + publish server/ as database "seaofsand"
 npm run dev                    # open in two browsers → two tramplers
 ```
 
-`VITE_STDB_URI` (default `ws://localhost:3000`) and `VITE_STDB_DB`
-(default `seaofsand`) point the client elsewhere. After changing the schema
-in `server/src/lib.rs`, re-run `npm run server:publish` and
+`VITE_STDB_URI` and `VITE_STDB_DB` (default `seaofsand`) point the client
+elsewhere; without an explicit URI, dev builds use `ws://localhost:3000`
+and production builds use `wss://maincloud.spacetimedb.com`. After changing
+the schema in `server/src/lib.rs`, re-run `npm run server:publish` and
 `npm run server:generate` (regenerates `src/module_bindings/`).
+
+## Deploy
+
+- **Server → Maincloud**: `spacetime login`, then
+  `cd server && spacetime publish -s maincloud seaofsand`.
+- **Client → Vercel**: standard Vite static site — framework preset “Vite”,
+  build `npm run build`, output `dist/`. No env vars needed (production
+  defaults to Maincloud); set `VITE_STDB_URI`/`VITE_STDB_DB` to override.
 
 How it syncs, per the handoff contract:
 

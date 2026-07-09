@@ -65,8 +65,11 @@ net.onRemoteGone = id => {
   remoteWalkers.get(id)?.dispose();
   remoteWalkers.delete(id);
 };
+// dev builds default to a local spacetime instance, production to Maincloud;
+// override either with VITE_STDB_URI / VITE_STDB_DB at build time
 net.connect(
-  import.meta.env.VITE_STDB_URI ?? 'ws://localhost:3000',
+  import.meta.env.VITE_STDB_URI
+    ?? (import.meta.env.PROD ? 'wss://maincloud.spacetimedb.com' : 'ws://localhost:3000'),
   import.meta.env.VITE_STDB_DB ?? 'seaofsand',
   `raider-${Math.random().toString(36).slice(2, 7)}`,
 );
