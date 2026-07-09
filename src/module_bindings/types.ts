@@ -22,6 +22,20 @@ export const Player = __t.object("Player", {
 });
 export type Player = __Infer<typeof Player>;
 
+export const Projectile = __t.object("Projectile", {
+  id: __t.u64(),
+  roomId: __t.u64(),
+  shooter: __t.u64(),
+  posX: __t.f32(),
+  posY: __t.f32(),
+  posZ: __t.f32(),
+  velX: __t.f32(),
+  velY: __t.f32(),
+  velZ: __t.f32(),
+  spawned: __t.timestamp(),
+});
+export type Projectile = __Infer<typeof Projectile>;
+
 export const Room = __t.object("Room", {
   id: __t.u64(),
   name: __t.string(),
@@ -52,6 +66,10 @@ export const Trampler = __t.object("Trampler", {
   color: __t.u32(),
   hpHull: __t.u16(),
   hpEngine: __t.u16(),
+  gunYaw: __t.f32(),
+  gunPitch: __t.f32(),
+  lastFire: __t.timestamp(),
+  diedAt: __t.option(__t.timestamp()),
 });
 export type Trampler = __Infer<typeof Trampler>;
 

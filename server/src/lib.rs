@@ -20,17 +20,26 @@ const MAX_PLAYERS_PER_ROOM: u32 = 24;
 const EMPTY_ROOM_TTL_MICROS: i64 = 60_000_000; // empty player-rooms live 60s
 
 /// Frame presets (index = frame_id). MUST match FRAMES in src/frames.ts —
-/// max speed drives both server integration and client prediction.
-///                            max_spd hull engine
-const FRAME_STATS: [(f32, u16, u16); 3] = [
-    (12.0, 60, 60),   // 0 scout    "DUNE SKIMMER"
-    (9.0, 100, 100),  // 1 mid      "TRAMPLER MK.I"
-    (6.0, 180, 160),  // 2 fortress "FORTRESS"
+/// max speed drives both server integration and client prediction, and
+/// scale drives muzzle offsets and hit radii.
+///                                 max_spd hull engine scale
+const FRAME_STATS: [(f32, u16, u16, f32); 3] = [
+    (12.0, 60, 60, 0.75),   // 0 scout    "DUNE SKIMMER"
+    (9.0, 100, 100, 1.0),   // 1 mid      "TRAMPLER MK.I"
+    (6.0, 180, 160, 1.35),  // 2 fortress "FORTRESS"
 ];
 
-fn frame_stats(frame_id: u32) -> (f32, u16, u16) {
+fn frame_stats(frame_id: u32) -> (f32, u16, u16, f32) {
     FRAME_STATS[(frame_id as usize).min(FRAME_STATS.len() - 1)]
 }
+
+// ballistics — MUST match combat constants in src/combat.ts
+const MUZZLE_VEL: f32 = 70.0;
+const GRAVITY: f32 = 22.0;
+const PROJECTILE_DMG: u16 = 25;
+const PROJECTILE_TTL_MICROS: i64 = 6_000_000;
+const FIRE_COOLDOWN_MICROS: i64 = 850_000; // client shows 0.9s; small grace
+const WRECK_TTL_MICROS: i64 = 30_000_000;  // dead tramplers linger 30s
 
 /// Analytic dune heightfield. MUST match `terrainH` in src/terrain.ts exactly —
 /// this function is the physics on both sides of the wire.
@@ -69,7 +78,28 @@ pub struct Trampler {
     pub frame_id: u32, // preset frames only in v1 (see FRAME_STATS)
     pub color: u32,    // hull tint, 0xRRGGBB
     pub hp_hull: u16,
-    pub hp_engine: u16,
+    pub hp_engine: u16, // 0 = dead: kinematics freeze, wreck reaped later
+    pub gun_yaw: f32,   // turret aim relative to hull (remote turret display)
+    pub gun_pitch: f32,
+    pub last_fire: Timestamp,
+    pub died_at: Option<Timestamp>,
+}
+
+#[table(accessor = projectile, public)]
+pub struct Projectile {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    #[index(btree)]
+    pub room_id: u64,
+    pub shooter: u64, // trampler id, immune to its own shells
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub pos_z: f32,
+    pub vel_x: f32,
+    pub vel_y: f32,
+    pub vel_z: f32,
+    pub spawned: Timestamp,
 }
 
 #[table(accessor = player, public)]
@@ -203,7 +233,7 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
         return Err("unknown frame".into());
     }
     despawn_trampler(ctx, &mut p); // respawn = replace
-    let (_, hull, engine) = frame_stats(frame_id);
+    let (_, hull, engine, _) = frame_stats(frame_id);
     // deterministic-ish scatter so spawns in a room don't overlap
     let n = ctx.db.trampler().count() as f32 + p.room_id as f32;
     let x = (n * 37.0) % 120.0 - 60.0;
@@ -223,6 +253,10 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
         color: color & 0xff_ff_ff,
         hp_hull: hull,
         hp_engine: engine,
+        gun_yaw: 0.0,
+        gun_pitch: 0.0,
+        last_fire: Timestamp::UNIX_EPOCH,
+        died_at: None,
     });
     p.trampler_id = Some(t.id);
     ctx.db.player().identity().update(p);
@@ -230,12 +264,64 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
 }
 
 #[reducer]
-pub fn set_input(ctx: &ReducerContext, throttle: f32, steer: f32) -> Result<(), String> {
+pub fn set_input(ctx: &ReducerContext, throttle: f32, steer: f32,
+                 gun_yaw: f32, gun_pitch: f32) -> Result<(), String> {
     let p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
     let id = p.trampler_id.ok_or("no trampler")?;
     let mut t = ctx.db.trampler().id().find(id).ok_or("trampler gone")?;
+    if t.hp_engine == 0 {
+        return Err("trampler is dead".into());
+    }
     t.throttle = throttle.clamp(-0.5, 1.0);
     t.steer = steer.clamp(-1.0, 1.0);
+    t.gun_yaw = gun_yaw.clamp(-2.0, 2.0);
+    t.gun_pitch = gun_pitch.clamp(-0.6, 0.4);
+    ctx.db.trampler().id().update(t);
+    Ok(())
+}
+
+#[reducer]
+pub fn fire(ctx: &ReducerContext, gun_yaw: f32, gun_pitch: f32) -> Result<(), String> {
+    let p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+    let id = p.trampler_id.ok_or("no trampler")?;
+    let mut t = ctx.db.trampler().id().find(id).ok_or("trampler gone")?;
+    if t.hp_engine == 0 {
+        return Err("trampler is dead".into());
+    }
+    let elapsed = ctx.timestamp.duration_since(t.last_fire)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(i64::MAX);
+    if elapsed < FIRE_COOLDOWN_MICROS {
+        return Err("cooldown".into());
+    }
+    let gy = gun_yaw.clamp(-2.0, 2.0);
+    let gp = gun_pitch.clamp(-0.6, 0.4);
+    let (_, _, _, s) = frame_stats(t.frame_id);
+
+    // muzzle position + barrel direction; mirrors the client turret hierarchy:
+    // turret base local (0, 2.2s, 2.8s) on the hull, pitch pivot +0.5s up,
+    // barrel reach 4.4s. positive pitch points down (three.js rotation.x).
+    let wy = t.yaw + gy; // barrel yaw in world
+    let (dir_x, dir_y, dir_z) = (wy.sin() * gp.cos(), -gp.sin(), wy.cos() * gp.cos());
+    let bx = t.pos_x + t.yaw.sin() * 2.8 * s;
+    let by = t.pos_y + 2.7 * s;
+    let bz = t.pos_z + t.yaw.cos() * 2.8 * s;
+
+    ctx.db.projectile().insert(Projectile {
+        id: 0,
+        room_id: t.room_id,
+        shooter: t.id,
+        pos_x: bx + dir_x * 4.4 * s,
+        pos_y: by + dir_y * 4.4 * s,
+        pos_z: bz + dir_z * 4.4 * s,
+        vel_x: dir_x * MUZZLE_VEL,
+        vel_y: dir_y * MUZZLE_VEL,
+        vel_z: dir_z * MUZZLE_VEL,
+        spawned: ctx.timestamp,
+    });
+    t.gun_yaw = gy;
+    t.gun_pitch = gp;
+    t.last_fire = ctx.timestamp;
     ctx.db.trampler().id().update(t);
     Ok(())
 }
@@ -247,6 +333,23 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
     }
     let dt = TICK_MS as f32 / 1000.0;
     for mut t in ctx.db.trampler().iter() {
+        // dead tramplers are frozen wrecks; reap them after a while
+        if t.hp_engine == 0 {
+            let expired = t.died_at
+                .and_then(|d| ctx.timestamp.duration_since(d))
+                .map(|d| d.as_micros() as i64 > WRECK_TTL_MICROS)
+                .unwrap_or(true);
+            if expired {
+                if let Some(mut p) = ctx.db.player().identity().find(t.owner) {
+                    if p.trampler_id == Some(t.id) {
+                        p.trampler_id = None;
+                        ctx.db.player().identity().update(p);
+                    }
+                }
+                ctx.db.trampler().id().delete(&t.id);
+            }
+            continue;
+        }
         // parked tramplers settle to exactly zero and stop generating updates
         if t.throttle == 0.0 && t.steer == 0.0 && t.speed.abs() < 0.005 {
             if t.speed != 0.0 {
@@ -255,7 +358,7 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
             }
             continue;
         }
-        let (max_spd, _, _) = frame_stats(t.frame_id);
+        let (max_spd, _, _, _) = frame_stats(t.frame_id);
         // same integrator as Walker.drive in src/walker.ts
         t.speed += (t.throttle * max_spd - t.speed)
             * (ACCEL * dt / t.speed.abs().max(1.0)).min(1.0);
@@ -271,6 +374,57 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
         ctx.db.trampler().id().update(t);
     }
 
+    // integrate projectiles: ballistic arc, terrain + trampler hits, TTL
+    for mut pr in ctx.db.projectile().iter() {
+        pr.vel_y -= GRAVITY * dt;
+        pr.pos_x += pr.vel_x * dt;
+        pr.pos_y += pr.vel_y * dt;
+        pr.pos_z += pr.vel_z * dt;
+
+        let expired = ctx.timestamp.duration_since(pr.spawned)
+            .map(|d| d.as_micros() as i64 > PROJECTILE_TTL_MICROS)
+            .unwrap_or(true);
+        let mut hit = expired || pr.pos_y <= terrain_h(pr.pos_x, pr.pos_z);
+
+        if !hit {
+            for mut t in ctx.db.trampler().room_id().filter(&pr.room_id) {
+                if t.id == pr.shooter || t.hp_engine == 0 {
+                    continue;
+                }
+                let (_, _, _, s) = frame_stats(t.frame_id);
+                let dx = pr.pos_x - t.pos_x;
+                let dy = pr.pos_y - (t.pos_y + 1.0 * s);
+                let dz = pr.pos_z - t.pos_z;
+                if dx * dx + dy * dy + dz * dz < (4.2 * s) * (4.2 * s) {
+                    hit = true;
+                    // hull soaks damage first, then the engine; engine 0 = dead
+                    let dmg = PROJECTILE_DMG;
+                    if t.hp_hull >= dmg {
+                        t.hp_hull -= dmg;
+                    } else {
+                        let spill = dmg - t.hp_hull;
+                        t.hp_hull = 0;
+                        t.hp_engine = t.hp_engine.saturating_sub(spill);
+                        if t.hp_engine == 0 {
+                            t.died_at = Some(ctx.timestamp);
+                            t.throttle = 0.0;
+                            t.steer = 0.0;
+                            t.speed = 0.0;
+                        }
+                    }
+                    ctx.db.trampler().id().update(t);
+                    break;
+                }
+            }
+        }
+
+        if hit {
+            ctx.db.projectile().id().delete(&pr.id);
+        } else {
+            ctx.db.projectile().id().update(pr);
+        }
+    }
+
     // reap player-founded rooms that have been empty for a minute
     let now = ctx.timestamp;
     let doomed: Vec<u64> = ctx.db.room().iter()
@@ -284,6 +438,9 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
     for id in doomed {
         for t in ctx.db.trampler().room_id().filter(&id).collect::<Vec<_>>() {
             ctx.db.trampler().id().delete(&t.id);
+        }
+        for pr in ctx.db.projectile().room_id().filter(&id).collect::<Vec<_>>() {
+            ctx.db.projectile().id().delete(&pr.id);
         }
         ctx.db.room().id().delete(&id);
     }

@@ -61,10 +61,17 @@ function buildOwnWalker(frameId: number, color: number): Walker {
   return w;
 }
 
+let offline = false;
+
 input.onFire = () => {
-  if (!walker || lobby.visible) return;
+  if (!walker || walker.dead || lobby.visible || !combat.canFire) return;
   effects.resumeAudio();
-  combat.fire(walker);
+  combat.muzzleFlash(walker);
+  if (offline) {
+    combat.fireLocal(walker);
+  } else {
+    net.fire(walker.turretYaw.rotation.y, walker.turretPitch.rotation.x);
+  }
 };
 
 // ---------- networking ----------
@@ -88,13 +95,26 @@ net.onOwnDespawn = () => {
   walker?.dispose();
   walker = null;
 };
+net.onOwnHp = (hull, engine) => hud.setHp(hull, engine);
+net.onOwnDead = () => {
+  if (walker) walker.dead = true;
+  hud.flash('ENGINE DESTROYED — TRAMPLER LOST');
+  effects.thud(30, 1.5, 0.9);
+  window.setTimeout(() => {
+    lobby.show();
+    lobby.setStatus('trampler lost — refit and redeploy');
+  }, 3500);
+};
 net.onRemoteGone = id => {
   remoteWalkers.get(id)?.dispose();
   remoteWalkers.delete(id);
 };
 net.onRoomChanged = () => {
   hud.setRoom(roomNames.get(net.roomId) ?? '…');
+  combat.clearShells();
 };
+net.onProjectileSpawn = p => combat.onSpawn(p);
+net.onProjectileGone = id => combat.onGone(id);
 
 // dev builds default to a local spacetime instance, production to Maincloud;
 // override either with VITE_STDB_URI / VITE_STDB_DB at build time
@@ -107,9 +127,11 @@ net.connect(
 
 // ---------- lobby flow ----------
 function enterOffline(loadout: Loadout): void {
+  offline = true;
   const w = buildOwnWalker(loadout.frameId, loadout.color);
   w.setPose(0, 0, 0, 0);
   w.snapFeet();
+  combat.enableOfflineRange();
   hud.setRoom('open desert (offline)');
   lobby.hide();
   hud.flash('NO LINK — RUNNING DARK');
@@ -148,19 +170,22 @@ function animate(): void {
   const dt = Math.min(rawDt, 0.05); // cosmetic dt (gait, particles, camera)
   const now = performance.now();
 
-  const throttle = lobby.visible ? 0 : input.throttle;
-  const steer = lobby.visible ? 0 : input.steer;
+  const throttle = lobby.visible || walker?.dead ? 0 : input.throttle;
+  const steer = lobby.visible || walker?.dead ? 0 : input.steer;
 
   if (walker) {
     // own trampler: predict locally, reconcile toward server.
     // Substep the integrator so slow frames don't dilate simulated time —
     // the server integrates in real time and we must match it.
-    for (let rem = rawDt; rem > 0; rem -= 0.05) {
-      walker.drive(Math.min(rem, 0.05), throttle, steer);
+    if (!walker.dead) {
+      for (let rem = rawDt; rem > 0; rem -= 0.05) {
+        walker.drive(Math.min(rem, 0.05), throttle, steer);
+      }
     }
-    net.sendInput(throttle, steer, now);
+    net.sendInput(throttle, steer,
+      walker.turretYaw.rotation.y, walker.turretPitch.rotation.x, now);
     const own = net.ownState;
-    if (own) {
+    if (own && !walker.dead) {
       const ex = own.x - walker.root.position.x;
       const ez = own.z - walker.root.position.z;
       if (Math.hypot(ex, ez) > SNAP_DIST) {
@@ -175,7 +200,7 @@ function animate(): void {
       }
     }
     walker.animate(dt);
-    walker.aimTurret(input.mouseX, input.mouseY);
+    if (!walker.dead) walker.aimTurret(input.mouseX, input.mouseY);
   }
 
   // remote tramplers: interpolate + derive gait locally
@@ -191,7 +216,12 @@ function animate(): void {
       remoteWalkers.set(id, rw);
     }
     const pose = net.samplePose(remote, now);
-    if (pose) rw.setPose(pose.x, pose.z, pose.yaw, pose.speed);
+    if (pose && !rw.dead) rw.setPose(pose.x, pose.z, pose.yaw, pose.speed);
+    if (remote.hpEngine === 0 && !rw.dead) rw.dead = true;
+    rw.turretYaw.rotation.y = THREE.MathUtils.lerp(
+      rw.turretYaw.rotation.y, remote.gunYaw, 0.15);
+    rw.turretPitch.rotation.x = THREE.MathUtils.lerp(
+      rw.turretPitch.rotation.x, remote.gunPitch, 0.15);
     rw.animate(dt);
   }
 
@@ -233,8 +263,9 @@ declare global {
       getWalker: () => Walker | null;
       net: Net;
       lobby: Lobby;
+      combat: Combat;
       remoteWalkers: Map<bigint, Walker>;
     };
   }
 }
-window.__sos = { getWalker: () => walker, net, lobby, remoteWalkers };
+window.__sos = { getWalker: () => walker, net, lobby, combat, remoteWalkers };

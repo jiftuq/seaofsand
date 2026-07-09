@@ -76,6 +76,16 @@ How it syncs, per the handoff contract:
       per-room (`WHERE room_id = …`) so rooms never see each other's traffic.
       Multi-crew tramplers (up to ~6 aboard: driver, gunners, deck) arrive
       with the M4-era crew work — today each player drives their own.
+- [x] **M3 — Combat**: server-authoritative projectiles — the `fire`
+      reducer spawns a shell row from the turret muzzle (cooldown enforced
+      server-side), the 20Hz tick integrates the ballistic arc and resolves
+      terrain/trampler hits per room. 25 damage per hit: hull soaks first,
+      spill hits the engine, engine 0 = dead. Dead tramplers collapse (gait
+      stops, hull settles onto the sand), inputs are rejected, the wreck
+      lingers 30s, and the owner is sent back to the lobby to refit and
+      redeploy. Turret aim (gun yaw/pitch) syncs with the input stream so
+      remote turrets track. Clients render shells by integrating the same
+      arc locally from the spawn snapshot and explode where the row deletes.
 - [ ] **M3 — Combat** (server-authoritative projectiles, hull/engine HP)
 - [ ] **M4 — Loot + extraction**
 - [ ] **M5 — Stakes** (persistent loot per Identity)
@@ -86,7 +96,7 @@ How it syncs, per the handoff contract:
 | --- | --- |
 | `src/terrain.ts` | analytic dune heightfield `terrainH(x,z)` + mesh. This function IS the physics; the server must implement it identically. |
 | `src/walker.ts` | trampler build, drive integrator, tripod gait, two-bone leg IK. Cosmetic only — never networked; clients derive gait from pos/yaw/speed. |
-| `src/combat.ts` | turret fire, ballistic projectiles, destructible derelict (client-side until M3) |
+| `src/combat.ts` | shell rendering for server projectiles; offline practice range |
 | `src/net.ts` | SpacetimeDB connection, snapshot buffers, room subscriptions, input send |
 | `src/lobby.ts` | homepage overlay: callsign, frame/paint pick, room list |
 | `src/frames.ts` | frame presets — stats must match `FRAME_STATS` in the server |

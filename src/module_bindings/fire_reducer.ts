@@ -11,8 +11,6 @@ import {
 } from "spacetimedb";
 
 export default {
-  throttle: __t.f32(),
-  steer: __t.f32(),
   gunYaw: __t.f32(),
   gunPitch: __t.f32(),
 };

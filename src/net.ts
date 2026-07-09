@@ -23,7 +23,17 @@ export interface RemoteTrampler {
   id: bigint;
   frameId: number;
   color: number;
+  gunYaw: number;
+  gunPitch: number;
+  hpHull: number;
+  hpEngine: number;
   buffer: PoseSnapshot[];
+}
+
+export interface ProjectileSpawn {
+  id: bigint;
+  pos: { x: number; y: number; z: number };
+  vel: { x: number; y: number; z: number };
 }
 
 export interface RoomInfo {
@@ -55,7 +65,10 @@ export class Net {
   connected = false;
   roomId = 1n; // room 1 = open desert, where every player starts
   /** Own trampler's latest server state (reconciliation target). */
-  ownState: (PoseSnapshot & { id: bigint; frameId: number; color: number }) | null = null;
+  ownState: (PoseSnapshot & {
+    id: bigint; frameId: number; color: number;
+    hpHull: number; hpEngine: number;
+  }) | null = null;
   /** Everyone else's tramplers in this room, keyed by id. */
   remotes = new Map<bigint, RemoteTrampler>();
 
@@ -63,7 +76,12 @@ export class Net {
   /** Fired when the server assigns us a (new) trampler. */
   onOwnSpawn?: (snap: PoseSnapshot, frameId: number, color: number) => void;
   onOwnDespawn?: () => void;
+  /** Fired once when our engine hits 0 — the trampler is lost. */
+  onOwnDead?: () => void;
+  onOwnHp?: (hull: number, engine: number) => void;
   onRemoteGone?: (id: bigint) => void;
+  onProjectileSpawn?: (p: ProjectileSpawn) => void;
+  onProjectileGone?: (id: bigint) => void;
   /** Fired whenever the room list or player counts change. */
   onRoomsChanged?: (rooms: RoomInfo[]) => void;
   /** Fired after our player row lands in a different room. */
@@ -112,9 +130,12 @@ export class Net {
       .build();
   }
 
+  private projectileSub: SubscriptionHandle | null = null;
+
   private subscribeRoomTramplers(): void {
     if (!this.conn) return;
     this.tramplerSub?.unsubscribe();
+    this.projectileSub?.unsubscribe();
     // drop everything from the previous room
     for (const id of [...this.remotes.keys()]) {
       this.remotes.delete(id);
@@ -129,6 +150,8 @@ export class Net {
         for (const row of this.conn!.db.trampler.iter()) this.ingest(row);
       })
       .subscribe(`SELECT * FROM trampler WHERE room_id = ${this.roomId}`);
+    this.projectileSub = this.conn.subscriptionBuilder()
+      .subscribe(`SELECT * FROM projectile WHERE room_id = ${this.roomId}`);
   }
 
   private registerTableCallbacks(conn: DbConnection): void {
@@ -142,6 +165,13 @@ export class Net {
       }
       if (this.remotes.delete(row.id)) this.onRemoteGone?.(row.id);
     });
+
+    conn.db.projectile.onInsert((_ctx, row) => this.onProjectileSpawn?.({
+      id: row.id,
+      pos: { x: row.posX, y: row.posY, z: row.posZ },
+      vel: { x: row.velX, y: row.velY, z: row.velZ },
+    }));
+    conn.db.projectile.onDelete((_ctx, row) => this.onProjectileGone?.(row.id));
 
     const roomsChanged = () => this.emitRooms();
     conn.db.room.onInsert(roomsChanged);
@@ -180,6 +210,7 @@ export class Net {
   private ingest(row: {
     id: bigint; owner: Identity; frameId: number; color: number;
     posX: number; posY: number; posZ: number; yaw: number; speed: number;
+    gunYaw: number; gunPitch: number; hpHull: number; hpEngine: number;
   }): void {
     const snap: PoseSnapshot = {
       t: performance.now(),
@@ -188,15 +219,29 @@ export class Net {
     };
     if (this.identity && row.owner.isEqual(this.identity)) {
       const isNew = this.ownState === null || this.ownState.id !== row.id;
-      this.ownState = { ...snap, id: row.id, frameId: row.frameId, color: row.color };
+      const wasAlive = isNew || this.ownState!.hpEngine > 0;
+      this.ownState = {
+        ...snap, id: row.id, frameId: row.frameId, color: row.color,
+        hpHull: row.hpHull, hpEngine: row.hpEngine,
+      };
       if (isNew) this.onOwnSpawn?.(snap, row.frameId, row.color);
+      this.onOwnHp?.(row.hpHull, row.hpEngine);
+      if (wasAlive && row.hpEngine === 0 && !isNew) this.onOwnDead?.();
       return;
     }
     let r = this.remotes.get(row.id);
     if (!r) {
-      r = { id: row.id, frameId: row.frameId, color: row.color, buffer: [] };
+      r = {
+        id: row.id, frameId: row.frameId, color: row.color,
+        gunYaw: row.gunYaw, gunPitch: row.gunPitch,
+        hpHull: row.hpHull, hpEngine: row.hpEngine, buffer: [],
+      };
       this.remotes.set(row.id, r);
     }
+    r.gunYaw = row.gunYaw;
+    r.gunPitch = row.gunPitch;
+    r.hpHull = row.hpHull;
+    r.hpEngine = row.hpEngine;
     r.buffer.push(snap);
     const cutoff = snap.t - BUFFER_KEEP_MS;
     while (r.buffer.length > 2 && r.buffer[0].t < cutoff) r.buffer.shift();
@@ -226,17 +271,32 @@ export class Net {
     return buf[buf.length - 1];
   }
 
-  /** Rate-limited, change-deduplicated input send. */
-  sendInput(throttle: number, steer: number, now: number): void {
+  private lastGunYaw = NaN;
+  private lastGunPitch = NaN;
+
+  /** Rate-limited, change-deduplicated input + turret aim send. */
+  sendInput(throttle: number, steer: number,
+            gunYaw: number, gunPitch: number, now: number): void {
     if (!this.conn || !this.connected || !this.ownState) return;
-    const changed = throttle !== this.lastThrottle || steer !== this.lastSteer;
+    if (this.ownState.hpEngine === 0) return; // dead — server rejects anyway
+    // drive changes send immediately (responsiveness); aim drift is capped at
+    // the send rate; a parked, still turret sends nothing at all
+    const driveChanged = throttle !== this.lastThrottle || steer !== this.lastSteer;
+    const aimChanged = Math.abs(gunYaw - this.lastGunYaw) > 0.02
+      || Math.abs(gunPitch - this.lastGunPitch) > 0.02;
     const due = now - this.lastInputSent > 1000 / INPUT_SEND_HZ;
-    if (!changed && !due) return;
-    if (!changed && this.lastThrottle === 0 && this.lastSteer === 0) return;
+    if (!driveChanged && !(aimChanged && due)) return;
     this.lastThrottle = throttle;
     this.lastSteer = steer;
+    this.lastGunYaw = gunYaw;
+    this.lastGunPitch = gunPitch;
     this.lastInputSent = now;
-    this.conn.reducers.setInput({ throttle, steer }).catch(() => {});
+    this.conn.reducers.setInput({ throttle, steer, gunYaw, gunPitch }).catch(() => {});
+  }
+
+  fire(gunYaw: number, gunPitch: number): void {
+    if (!this.conn || !this.connected) return;
+    this.conn.reducers.fire({ gunYaw, gunPitch }).catch(() => {});
   }
 
   spawn(frameId: number, color: number): Promise<void> {

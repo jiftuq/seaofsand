@@ -67,6 +67,7 @@ export class Walker {
   yaw = 0;
   recoil = 0;
   gaitPhase = 0;
+  dead = false; // collapse: gait stops, hull settles onto the sand
 
   onFootfall?: (pos: THREE.Vector3) => void;
   onSmokePuff?: (pos: THREE.Vector3) => void;
@@ -220,6 +221,20 @@ export class Walker {
     this.recoil = Math.max(0, this.recoil - dt * 1.2);
     this.root.rotation.y = this.yaw;
     this.root.updateMatrixWorld();
+
+    if (this.dead) {
+      // legs go limp: no gait, hull sinks to the sand and lists to one side
+      let avgY = 0;
+      for (const leg of this.legs) avgY += leg.footW.y;
+      avgY /= this.legs.length;
+      this.root.position.y = THREE.MathUtils.lerp(
+        this.root.position.y, avgY + this.clearance * 0.28, 1 - Math.exp(-dt * 2));
+      this.bodyRig.rotation.x = THREE.MathUtils.lerp(this.bodyRig.rotation.x, 0.12, 0.03);
+      this.bodyRig.rotation.z = THREE.MathUtils.lerp(this.bodyRig.rotation.z, 0.22, 0.03);
+      this.root.updateMatrixWorld();
+      for (const leg of this.legs) this.solveLeg(leg);
+      return;
+    }
 
     // world-space velocity, used to lead the feet in the direction of travel —
     // works identically in reverse

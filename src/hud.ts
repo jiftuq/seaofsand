@@ -21,6 +21,10 @@ export class Hud {
     this.tgt.textContent = `derelict integrity: ${hp}%`;
   }
 
+  setHp(hull: number, engine: number): void {
+    this.tgt.textContent = `hull ${hull} · engine ${engine}`;
+  }
+
   flash(text: string): void {
     this.msg.textContent = text;
     this.msg.style.opacity = '1';
