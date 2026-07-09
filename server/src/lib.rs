@@ -43,11 +43,35 @@ const WRECK_TTL_MICROS: i64 = 30_000_000;  // dead tramplers linger 30s
 
 // loot + extraction
 const POIS_PER_ROOM: u64 = 5;
-const POI_SALVAGE: u16 = 25;
 const LOOT_RANGE: f32 = 20.0;
 const LOOT_PER_GRAB: u16 = 5;
 const LOOT_COOLDOWN_MICROS: i64 = 700_000;
 const EXTRACTION_MICROS: i64 = 60_000_000; // survive 60s under the green smoke
+
+// salvage tiers — MUST match ITEMS in src/frames.ts
+// item_type:                 0 scrap  1 alloy  2 relic
+const ITEM_VALUES: [u32; 3] = [1, 3, 8];
+const POI_AMOUNTS: [u16; 3] = [25, 15, 8]; // site stock per tier
+const POI_TYPE_PATTERN: [u16; 5] = [0, 0, 1, 0, 2]; // per-room site mix
+
+// progression + protection
+const SPAWN_SHIELD_MICROS: i64 = 8_000_000;
+const FORTRESS_COST: u32 = 100;
+const REPAIR_COST: u32 = 15;
+
+// mounted guns (crew stations) — slots per frame_id
+const GUN_SLOTS: [u8; 3] = [0, 1, 2];
+const MOUNTED_DMG: u16 = 12;
+const MOUNTED_COOLDOWN_MICROS: i64 = 600_000;
+
+/// deck offset of a mounted gun slot at frame scale 1 — MUST match
+/// GUN_SLOT_OFFSETS in src/frames.ts
+fn gun_slot_offset(slot: u8) -> (f32, f32, f32) {
+    match slot {
+        0 => (-2.2, 2.6, -0.5),
+        _ => (2.2, 2.6, 0.5),
+    }
+}
 
 /// Analytic dune heightfield. MUST match `terrainH` in src/terrain.ts exactly —
 /// this function is the physics on both sides of the wire.
@@ -92,6 +116,7 @@ pub struct Trampler {
     pub last_fire: Timestamp,
     pub last_loot: Timestamp,
     pub died_at: Option<Timestamp>,
+    pub protected_until: Timestamp, // spawn shield; firing forfeits it early
 }
 
 #[table(accessor = loot_poi, public)]
@@ -103,7 +128,25 @@ pub struct LootPoi {
     pub room_id: u64,
     pub pos_x: f32,
     pub pos_z: f32,
+    pub item_type: u16, // see ITEM_VALUES
     pub remaining: u16,
+}
+
+/// Crew stations. A player mans at most one gun; manning replaces piloting.
+#[table(accessor = mounted_gun, public)]
+pub struct MountedGun {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    #[index(btree)]
+    pub room_id: u64,
+    #[index(btree)]
+    pub trampler_id: u64,
+    pub slot: u8,
+    pub yaw: f32,   // aim relative to hull
+    pub pitch: f32,
+    pub manned_by: Option<Identity>,
+    pub last_fire: Timestamp,
 }
 
 #[table(accessor = cargo_item, public)]
@@ -142,6 +185,7 @@ pub struct Projectile {
     pub vel_x: f32,
     pub vel_y: f32,
     pub vel_z: f32,
+    pub dmg: u16,
     pub spawned: Timestamp,
 }
 
@@ -165,7 +209,17 @@ pub struct Player {
 pub struct Vault {
     #[primary_key]
     pub identity: Identity,
-    pub salvage: u32,
+    pub salvage: u32, // value units (see ITEM_VALUES), spendable
+    pub fortress_unlocked: bool,
+}
+
+fn credit_vault(ctx: &ReducerContext, identity: Identity, amount: u32) {
+    if let Some(mut v) = ctx.db.vault().identity().find(identity) {
+        v.salvage += amount;
+        ctx.db.vault().identity().update(v);
+    } else {
+        ctx.db.vault().insert(Vault { identity, salvage: amount, fortress_unlocked: false });
+    }
 }
 
 #[table(accessor = tick_schedule, scheduled(tick))]
@@ -204,19 +258,23 @@ fn seed_pois(ctx: &ReducerContext, room_id: u64) {
         let seed = (room_id * 7919 + i * 104_729) as f32;
         let hx = ((seed * 12.9898).sin() * 43_758.547).rem_euclid(1.0);
         let hz = ((seed * 78.233).sin() * 43_758.547).rem_euclid(1.0);
+        let item_type = POI_TYPE_PATTERN[(i as usize) % POI_TYPE_PATTERN.len()];
         ctx.db.loot_poi().insert(LootPoi {
             id: 0,
             room_id,
             pos_x: hx * 280.0 - 140.0,
             pos_z: hz * 280.0 - 140.0,
-            remaining: POI_SALVAGE,
+            item_type,
+            remaining: POI_AMOUNTS[item_type as usize],
         });
     }
 }
 
-fn cargo_total(ctx: &ReducerContext, trampler_id: u64) -> u16 {
+/// Total cargo VALUE (qty × tier value) aboard a trampler.
+fn cargo_value(ctx: &ReducerContext, trampler_id: u64) -> u32 {
     ctx.db.cargo_item().trampler_id().filter(&trampler_id)
-        .map(|c| c.qty).sum()
+        .map(|c| c.qty as u32 * ITEM_VALUES[(c.item_type as usize).min(ITEM_VALUES.len() - 1)])
+        .sum()
 }
 
 fn drop_trampler_side_tables(ctx: &ReducerContext, trampler_id: u64) {
@@ -226,6 +284,18 @@ fn drop_trampler_side_tables(ctx: &ReducerContext, trampler_id: u64) {
     for b in ctx.db.extraction_beacon().iter().filter(|b| b.trampler_id == trampler_id)
         .collect::<Vec<_>>() {
         ctx.db.extraction_beacon().id().delete(&b.id);
+    }
+    for g in ctx.db.mounted_gun().trampler_id().filter(&trampler_id).collect::<Vec<_>>() {
+        ctx.db.mounted_gun().id().delete(&g.id);
+    }
+}
+
+/// Release any gun station this identity is manning.
+fn release_guns(ctx: &ReducerContext, identity: Identity) {
+    for mut g in ctx.db.mounted_gun().iter()
+        .filter(|g| g.manned_by == Some(identity)).collect::<Vec<_>>() {
+        g.manned_by = None;
+        ctx.db.mounted_gun().id().update(g);
     }
 }
 
@@ -248,6 +318,7 @@ pub fn client_connected(ctx: &ReducerContext) {
 pub fn client_disconnected(ctx: &ReducerContext) {
     if let Some(mut p) = ctx.db.player().identity().find(ctx.sender()) {
         p.online = false;
+        release_guns(ctx, ctx.sender());
         despawn_trampler(ctx, &mut p);
         p.room_id = OPEN_DESERT;
         ctx.db.player().identity().update(p);
@@ -290,6 +361,7 @@ pub fn create_room(ctx: &ReducerContext, name: String) -> Result<(), String> {
         max_players: MAX_PLAYERS_PER_ROOM,
     });
     seed_pois(ctx, room.id);
+    release_guns(ctx, ctx.sender());
     despawn_trampler(ctx, &mut p);
     p.room_id = room.id;
     ctx.db.player().identity().update(p);
@@ -306,6 +378,7 @@ pub fn join_room(ctx: &ReducerContext, room_id: u64) -> Result<(), String> {
     if online_count(ctx, room_id) >= room.max_players {
         return Err("room is full".into());
     }
+    release_guns(ctx, ctx.sender());
     despawn_trampler(ctx, &mut p);
     p.room_id = room_id;
     ctx.db.player().identity().update(p);
@@ -318,6 +391,14 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
     if frame_id as usize >= FRAME_STATS.len() {
         return Err("unknown frame".into());
     }
+    if frame_id == 2 {
+        let unlocked = ctx.db.vault().identity().find(ctx.sender())
+            .map(|v| v.fortress_unlocked).unwrap_or(false);
+        if !unlocked {
+            return Err("fortress locked — buy it in the lobby".into());
+        }
+    }
+    release_guns(ctx, ctx.sender());
     despawn_trampler(ctx, &mut p); // respawn = replace
     let (_, hull, engine, _) = frame_stats(frame_id);
     // deterministic-ish scatter so spawns in a room don't overlap
@@ -344,7 +425,20 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
         last_fire: Timestamp::UNIX_EPOCH,
         last_loot: Timestamp::UNIX_EPOCH,
         died_at: None,
+        protected_until: ctx.timestamp + TimeDuration::from_micros(SPAWN_SHIELD_MICROS),
     });
+    for slot in 0..GUN_SLOTS[frame_id as usize] {
+        ctx.db.mounted_gun().insert(MountedGun {
+            id: 0,
+            room_id: p.room_id,
+            trampler_id: t.id,
+            slot,
+            yaw: 0.0,
+            pitch: 0.0,
+            manned_by: None,
+            last_fire: Timestamp::UNIX_EPOCH,
+        });
+    }
     p.trampler_id = Some(t.id);
     ctx.db.player().identity().update(p);
     Ok(())
@@ -404,11 +498,13 @@ pub fn fire(ctx: &ReducerContext, gun_yaw: f32, gun_pitch: f32) -> Result<(), St
         vel_x: dir_x * MUZZLE_VEL,
         vel_y: dir_y * MUZZLE_VEL,
         vel_z: dir_z * MUZZLE_VEL,
+        dmg: PROJECTILE_DMG,
         spawned: ctx.timestamp,
     });
     t.gun_yaw = gy;
     t.gun_pitch = gp;
     t.last_fire = ctx.timestamp;
+    t.protected_until = ctx.timestamp; // opening fire forfeits the spawn shield
     ctx.db.trampler().id().update(t);
     Ok(())
 }
@@ -441,13 +537,15 @@ pub fn loot(ctx: &ReducerContext, poi_id: u64) -> Result<(), String> {
         return Err("stripped clean".into());
     }
 
-    // one salvage stack per trampler in v1
+    // one stack per salvage tier per trampler
     if let Some(mut stack) = ctx.db.cargo_item().trampler_id().filter(&id)
-        .find(|c| c.item_type == 0) {
+        .find(|c| c.item_type == poi.item_type) {
         stack.qty += take;
         ctx.db.cargo_item().id().update(stack);
     } else {
-        ctx.db.cargo_item().insert(CargoItem { id: 0, trampler_id: id, item_type: 0, qty: take });
+        ctx.db.cargo_item().insert(CargoItem {
+            id: 0, trampler_id: id, item_type: poi.item_type, qty: take,
+        });
     }
 
     poi.remaining -= take;
@@ -457,6 +555,132 @@ pub fn loot(ctx: &ReducerContext, poi_id: u64) -> Result<(), String> {
         ctx.db.loot_poi().id().update(poi);
     }
     t.last_loot = ctx.timestamp;
+    ctx.db.trampler().id().update(t);
+    Ok(())
+}
+
+#[reducer]
+pub fn buy_fortress(ctx: &ReducerContext) -> Result<(), String> {
+    let mut v = ctx.db.vault().identity().find(ctx.sender())
+        .ok_or("nothing banked yet")?;
+    if v.fortress_unlocked {
+        return Err("already unlocked".into());
+    }
+    if v.salvage < FORTRESS_COST {
+        return Err("not enough banked salvage".into());
+    }
+    v.salvage -= FORTRESS_COST;
+    v.fortress_unlocked = true;
+    ctx.db.vault().identity().update(v);
+    Ok(())
+}
+
+#[reducer]
+pub fn field_repair(ctx: &ReducerContext) -> Result<(), String> {
+    let p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+    let id = p.trampler_id.ok_or("no trampler")?;
+    let mut t = ctx.db.trampler().id().find(id).ok_or("trampler gone")?;
+    if t.hp_engine == 0 {
+        return Err("trampler is dead".into());
+    }
+    let (_, hull_max, _, _) = frame_stats(t.frame_id);
+    if t.hp_hull >= hull_max {
+        return Err("hull already sound".into());
+    }
+    let mut v = ctx.db.vault().identity().find(ctx.sender())
+        .ok_or("nothing banked yet")?;
+    if v.salvage < REPAIR_COST {
+        return Err("not enough banked salvage".into());
+    }
+    v.salvage -= REPAIR_COST;
+    ctx.db.vault().identity().update(v);
+    t.hp_hull = hull_max;
+    ctx.db.trampler().id().update(t);
+    Ok(())
+}
+
+#[reducer]
+pub fn mount_gun(ctx: &ReducerContext) -> Result<(), String> {
+    let mut p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+    // find a free station on a living trampler in our room (not our own)
+    let gun = ctx.db.mounted_gun().room_id().filter(&p.room_id)
+        .filter(|g| g.manned_by.is_none())
+        .find(|g| {
+            ctx.db.trampler().id().find(g.trampler_id)
+                .map(|t| t.hp_engine > 0 && t.owner != ctx.sender())
+                .unwrap_or(false)
+        });
+    let mut gun = gun.ok_or("no free gun stations in this room")?;
+    release_guns(ctx, ctx.sender());
+    despawn_trampler(ctx, &mut p); // crewing replaces piloting
+    ctx.db.player().identity().update(p);
+    gun.manned_by = Some(ctx.sender());
+    ctx.db.mounted_gun().id().update(gun);
+    Ok(())
+}
+
+#[reducer]
+pub fn dismount(ctx: &ReducerContext) {
+    release_guns(ctx, ctx.sender());
+}
+
+#[reducer]
+pub fn aim_gun(ctx: &ReducerContext, yaw: f32, pitch: f32) -> Result<(), String> {
+    let mut g = ctx.db.mounted_gun().iter()
+        .find(|g| g.manned_by == Some(ctx.sender()))
+        .ok_or("not manning a gun")?;
+    g.yaw = yaw.clamp(-3.2, 3.2);
+    g.pitch = pitch.clamp(-0.6, 0.4);
+    ctx.db.mounted_gun().id().update(g);
+    Ok(())
+}
+
+#[reducer]
+pub fn fire_gun(ctx: &ReducerContext, yaw: f32, pitch: f32) -> Result<(), String> {
+    let mut g = ctx.db.mounted_gun().iter()
+        .find(|g| g.manned_by == Some(ctx.sender()))
+        .ok_or("not manning a gun")?;
+    let mut t = ctx.db.trampler().id().find(g.trampler_id).ok_or("host gone")?;
+    if t.hp_engine == 0 {
+        return Err("host trampler is dead".into());
+    }
+    let elapsed = ctx.timestamp.duration_since(g.last_fire)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(i64::MAX);
+    if elapsed < MOUNTED_COOLDOWN_MICROS {
+        return Err("cooldown".into());
+    }
+    let gy = yaw.clamp(-3.2, 3.2);
+    let gp = pitch.clamp(-0.6, 0.4);
+    let (_, _, _, s) = frame_stats(t.frame_id);
+    let (ox, oy, oz) = gun_slot_offset(g.slot);
+
+    let wy = t.yaw + gy;
+    let (dir_x, dir_y, dir_z) = (wy.sin() * gp.cos(), -gp.sin(), wy.cos() * gp.cos());
+    // station base: hull center + yaw-rotated deck offset; barrel reach 3.0s
+    let bx = t.pos_x + (t.yaw.sin() * oz + t.yaw.cos() * ox) * s;
+    let by = t.pos_y + (oy + 0.4) * s;
+    let bz = t.pos_z + (t.yaw.cos() * oz - t.yaw.sin() * ox) * s;
+
+    ctx.db.projectile().insert(Projectile {
+        id: 0,
+        room_id: t.room_id,
+        shooter: t.id,
+        pos_x: bx + dir_x * 3.0 * s,
+        pos_y: by + dir_y * 3.0 * s,
+        pos_z: bz + dir_z * 3.0 * s,
+        vel_x: dir_x * MUZZLE_VEL,
+        vel_y: dir_y * MUZZLE_VEL,
+        vel_z: dir_z * MUZZLE_VEL,
+        dmg: MOUNTED_DMG,
+        spawned: ctx.timestamp,
+    });
+    g.yaw = gy;
+    g.pitch = gp;
+    g.last_fire = ctx.timestamp;
+    ctx.db.mounted_gun().id().update(g);
+    // crew fire also forfeits the host's spawn shield
+    t.protected_until = ctx.timestamp;
     ctx.db.trampler().id().update(t);
     Ok(())
 }
@@ -543,7 +767,8 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
 
         if !hit {
             for mut t in ctx.db.trampler().room_id().filter(&pr.room_id) {
-                if t.id == pr.shooter || t.hp_engine == 0 {
+                if t.id == pr.shooter || t.hp_engine == 0
+                    || ctx.timestamp < t.protected_until {
                     continue;
                 }
                 let (_, _, _, s) = frame_stats(t.frame_id);
@@ -553,7 +778,7 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
                 if dx * dx + dy * dy + dz * dz < (4.2 * s) * (4.2 * s) {
                     hit = true;
                     // hull soaks damage first, then the engine; engine 0 = dead
-                    let dmg = PROJECTILE_DMG;
+                    let dmg = pr.dmg;
                     if t.hp_hull >= dmg {
                         t.hp_hull -= dmg;
                     } else {
@@ -565,9 +790,9 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
                             t.throttle = 0.0;
                             t.steer = 0.0;
                             t.speed = 0.0;
-                            // the kill drops the victim's cargo as a fresh
-                            // salvage site at the wreck; beacon burns out
-                            let dropped = cargo_total(ctx, t.id);
+                            // the kill drops the victim's cargo VALUE as a
+                            // scrap site at the wreck; beacon burns out
+                            let dropped = cargo_value(ctx, t.id).min(u16::MAX as u32) as u16;
                             drop_trampler_side_tables(ctx, t.id);
                             if dropped > 0 {
                                 ctx.db.loot_poi().insert(LootPoi {
@@ -575,6 +800,7 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
                                     room_id: t.room_id,
                                     pos_x: t.pos_x,
                                     pos_z: t.pos_z,
+                                    item_type: 0,
                                     remaining: dropped,
                                 });
                             }
@@ -605,15 +831,10 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
             continue;
         }
         if ctx.timestamp >= b.ends_at {
-            // bank the cargo to the owner's vault (M5: persists between runs)
-            let loot = cargo_total(ctx, t.id) as u32;
+            // bank the cargo value to the owner's vault (persists between runs)
+            let loot = cargo_value(ctx, t.id);
             if loot > 0 {
-                if let Some(mut v) = ctx.db.vault().identity().find(t.owner) {
-                    v.salvage += loot;
-                    ctx.db.vault().identity().update(v);
-                } else {
-                    ctx.db.vault().insert(Vault { identity: t.owner, salvage: loot });
-                }
+                credit_vault(ctx, t.owner, loot);
             }
             if let Some(mut p) = ctx.db.player().identity().find(t.owner) {
                 if p.trampler_id == Some(t.id) {

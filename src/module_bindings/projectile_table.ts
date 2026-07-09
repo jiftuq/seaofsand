@@ -20,5 +20,6 @@ export default __t.row({
   velX: __t.f32().name("vel_x"),
   velY: __t.f32().name("vel_y"),
   velZ: __t.f32().name("vel_z"),
+  dmg: __t.u16(),
   spawned: __t.timestamp(),
 });

@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { buildTerrain, terrainH } from './terrain';
 import { Walker } from './walker';
 import { Combat } from './combat';
-import { Effects, dustMat, smokeMat } from './effects';
+import { Effects, dustMat, fireMat, smokeMat } from './effects';
 import { Hud } from './hud';
 import { Input } from './input';
 import { Net } from './net';
@@ -95,9 +95,33 @@ input.onExtract = () => {
     .catch(e => hud.flash(String(e?.message ?? e).toUpperCase()));
 };
 
+input.onRepair = () => {
+  if (!walker || walker.dead || lobby.visible || offline) return;
+  net.fieldRepair()
+    .then(() => hud.flash('HULL PATCHED — -15 SALVAGE'))
+    .catch(e => hud.flash(String(e?.message ?? e).toUpperCase()));
+};
+
+let gunnerCooldown = 0;
+
 input.onFire = () => {
-  if (!walker || walker.dead || lobby.visible || !combat.canFire) return;
+  if (lobby.visible) return;
   effects.resumeAudio();
+  // gunner mode: fire the manned station on the host trampler
+  if (net.ownGun) {
+    if (gunnerCooldown > 0) return;
+    gunnerCooldown = 0.65;
+    const host = remoteWalkers.get(net.ownGun.tramplerId);
+    net.fireGun(gunnerAimYaw, gunnerAimPitch);
+    if (host) {
+      const m = host.gunMuzzleWorld(net.ownGun.slot);
+      if (m) { effects.spawnBurst(m, 5, fireMat, 2.5, 2); }
+      host.recoil = 0.12;
+    }
+    effects.thud(85, 0.25, 0.4);
+    return;
+  }
+  if (!walker || walker.dead || !combat.canFire) return;
   combat.muzzleFlash(walker);
   if (offline) {
     combat.fireLocal(walker);
@@ -149,8 +173,16 @@ net.onProjectileSpawn = p => combat.onSpawn(p);
 net.onProjectileGone = id => combat.onGone(id);
 net.onPoiChanged = p => lootSites.upsert(p);
 net.onPoiGone = id => lootSites.remove(id);
-net.onCargo = qty => hud.setCargo(qty);
-net.onBanked = salvage => lobby.setBanked(salvage);
+net.onCargo = (qty, value) => hud.setCargo(qty, value);
+net.onVault = (salvage, unlocked) => lobby.setVault(salvage, unlocked);
+net.onGunnerEnd = () => {
+  if (lobby.visible) return; // we initiated it from the lobby
+  hud.flash('HOST TRAMPLER LOST');
+  window.setTimeout(() => {
+    lobby.show();
+    lobby.setStatus('host trampler lost — find another ride');
+  }, 2000);
+};
 net.onOwnExtracted = () => {
   walker?.dispose();
   walker = null;
@@ -191,6 +223,23 @@ lobby.onEnter = (roomId, loadout) => {
     .then(() => net.spawn(loadout.frameId, loadout.color))
     .catch(e => lobby.setStatus(String(e?.message ?? e)));
 };
+lobby.onBuyFortress = () => {
+  net.buyFortress()
+    .then(() => lobby.setStatus('fortress unlocked'))
+    .catch(e => lobby.setStatus(String(e?.message ?? e)));
+};
+lobby.onEnterGunner = (roomId, _name) => {
+  if (!net.connected) { lobby.setStatus('offline — no crews to join'); return; }
+  lobby.setStatus('finding a gun station…');
+  net.joinRoom(roomId)
+    .then(() => net.mountGun())
+    .then(() => {
+      lobby.hide();
+      hud.setRoom(roomNames.get(net.roomId) ?? '…');
+      hud.flash('GUN STATION MANNED — MOUSE AIM, CLICK FIRE');
+    })
+    .catch(e => lobby.setStatus(String(e?.message ?? e)));
+};
 lobby.onCreate = (roomName, loadout) => {
   if (!net.connected) { enterOffline(loadout); return; }
   lobby.setStatus('founding expedition…');
@@ -203,6 +252,8 @@ lobby.onCreate = (roomName, loadout) => {
 const clock = new THREE.Clock();
 const SNAP_DIST = 8; // metres of divergence before we hard-snap to the server
 let beaconSmokeT = 0;
+let gunnerAimYaw = 0;
+let gunnerAimPitch = 0;
 
 function lerpAngle(a: number, b: number, t: number): number {
   let d = (b - a) % (Math.PI * 2);
@@ -250,6 +301,15 @@ function animate(): void {
     if (!walker.dead) walker.aimTurret(input.mouseX, input.mouseY);
   }
 
+  gunnerCooldown = Math.max(0, gunnerCooldown - dt);
+
+  // gunner mode: aim our manned station with the mouse
+  if (net.ownGun && !lobby.visible) {
+    gunnerAimYaw = -input.mouseX * 2.6;
+    gunnerAimPitch = THREE.MathUtils.clamp(input.mouseY * 0.7 - 0.08, -0.5, 0.35);
+    net.sendGunAim(gunnerAimYaw, gunnerAimPitch, now);
+  }
+
   // remote tramplers: interpolate + derive gait locally
   for (const [id, remote] of net.remotes) {
     let rw = remoteWalkers.get(id);
@@ -272,6 +332,16 @@ function animate(): void {
     rw.animate(dt);
   }
 
+  // crew gun stations on every hull; our own manned gun is posed locally
+  for (const g of net.guns.values()) {
+    const host = net.ownState && g.tramplerId === net.ownState.id
+      ? walker
+      : remoteWalkers.get(g.tramplerId);
+    if (!host) continue;
+    if (g.mine) host.setGunAim(g.slot, gunnerAimYaw, gunnerAimPitch, 0.4);
+    else host.setGunAim(g.slot, g.yaw, g.pitch);
+  }
+
   // extraction beacons: a green smoke column marks each burning trampler
   beaconSmokeT -= dt;
   if (beaconSmokeT <= 0 && net.beacons.size > 0) {
@@ -290,14 +360,18 @@ function animate(): void {
     }
   }
 
+  if (net.ownGun && !lobby.visible) hud.setContext('GUN STATION — CLICK FIRE · ESC LOBBY');
   // HUD context line: extraction countdown wins, else nearby-salvage hint
   if (walker && !lobby.visible) {
     const ownBeacon = net.ownState
       ? [...net.beacons.values()].find(b => b.tramplerId === net.ownState!.id)
       : undefined;
+    const shieldMs = net.ownState ? net.ownState.protectedUntilMs - Date.now() : 0;
     if (ownBeacon) {
       const s = Math.max(0, Math.ceil((ownBeacon.endsAtMs - Date.now()) / 1000));
       hud.setContext(`EXTRACTION T-${s}s — HOLD OUT`);
+    } else if (shieldMs > 0) {
+      hud.setContext(`SPAWN SHIELD ${Math.ceil(shieldMs / 1000)}s`);
     } else {
       const poi = nearestPoi();
       hud.setContext(poi && poi.dist <= LOOT_RANGE ? `[E] SALVAGE HERE (${poi.remaining})` : '');
@@ -307,8 +381,20 @@ function animate(): void {
   combat.update(dt);
   effects.update(dt);
 
-  // camera: chase own trampler, or drift over the dunes as a lobby backdrop
-  if (walker) {
+  // camera: chase own trampler, ride the host as gunner, or drift as backdrop
+  const gunnerHost = net.ownGun ? remoteWalkers.get(net.ownGun.tramplerId) : undefined;
+  if (gunnerHost) {
+    const camOff = new THREE.Vector3(0, 10, -18)
+      .applyAxisAngle(new THREE.Vector3(0, 1, 0), gunnerHost.yaw + gunnerAimYaw * 0.4);
+    const camTarget = gunnerHost.root.position.clone().add(camOff);
+    camTarget.y = Math.max(camTarget.y, terrainH(camTarget.x, camTarget.z) + 3);
+    camera.position.lerp(camTarget, 0.08);
+    camera.lookAt(gunnerHost.root.position.clone().add(new THREE.Vector3(0, 3, 0)));
+    hud.setSpeed(gunnerHost.speed);
+    hud.setHeading(gunnerHost.yaw);
+    const hostRec = net.remotes.get(net.ownGun!.tramplerId);
+    if (hostRec) hud.setHp(hostRec.hpHull, hostRec.hpEngine);
+  } else if (walker) {
     const camOff = new THREE.Vector3(0, 9, -20)
       .applyAxisAngle(new THREE.Vector3(0, 1, 0), walker.yaw);
     const camTarget = walker.root.position.clone().add(camOff);

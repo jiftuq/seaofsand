@@ -9,6 +9,7 @@
 
 import { Identity } from 'spacetimedb';
 import { DbConnection, type SubscriptionHandle } from './module_bindings';
+import { ITEMS } from './frames';
 
 export interface PoseSnapshot {
   t: number; // local receive time, ms (performance.now())
@@ -27,7 +28,17 @@ export interface RemoteTrampler {
   gunPitch: number;
   hpHull: number;
   hpEngine: number;
+  protectedUntilMs: number;
   buffer: PoseSnapshot[];
+}
+
+export interface GunInfo {
+  id: bigint;
+  tramplerId: bigint;
+  slot: number;
+  yaw: number;
+  pitch: number;
+  mine: boolean;
 }
 
 export interface ProjectileSpawn {
@@ -40,6 +51,7 @@ export interface PoiInfo {
   id: bigint;
   x: number;
   z: number;
+  itemType: number;
   remaining: number;
 }
 
@@ -80,7 +92,7 @@ export class Net {
   /** Own trampler's latest server state (reconciliation target). */
   ownState: (PoseSnapshot & {
     id: bigint; frameId: number; color: number;
-    hpHull: number; hpEngine: number;
+    hpHull: number; hpEngine: number; protectedUntilMs: number;
   }) | null = null;
   /** Everyone else's tramplers in this room, keyed by id. */
   remotes = new Map<bigint, RemoteTrampler>();
@@ -90,8 +102,13 @@ export class Net {
   beacons = new Map<bigint, BeaconInfo>();
   /** Own trampler's salvage total. */
   ownCargo = 0;
-  /** Salvage banked to our Identity — survives between runs (M5). */
+  /** Salvage value banked to our Identity — survives between runs (M5). */
   ownBanked = 0;
+  fortressUnlocked = false;
+  /** Crew gun stations in this room, keyed by gun id. */
+  guns = new Map<bigint, GunInfo>();
+  /** The gun we are manning, if any (gunner mode). */
+  ownGun: GunInfo | null = null;
 
   onStatus?: (text: string) => void;
   /** Fired when the server assigns us a (new) trampler. */
@@ -105,8 +122,10 @@ export class Net {
   onProjectileGone?: (id: bigint) => void;
   onPoiChanged?: (p: PoiInfo) => void;
   onPoiGone?: (id: bigint) => void;
-  onCargo?: (qty: number) => void;
-  onBanked?: (salvage: number) => void;
+  onCargo?: (qty: number, value: number) => void;
+  onVault?: (salvage: number, fortressUnlocked: boolean) => void;
+  /** Gunner mode ended without us asking (host died/despawned). */
+  onGunnerEnd?: () => void;
   /** Fired when our beacon survives its full window: trampler lifts off. */
   onOwnExtracted?: () => void;
   /** Fired whenever the room list or player counts change. */
@@ -169,6 +188,7 @@ export class Net {
     this.projectileSub?.unsubscribe();
     this.poiSub?.unsubscribe();
     this.beaconSub?.unsubscribe();
+    this.gunSub?.unsubscribe();
     // drop everything from the previous room
     for (const id of [...this.remotes.keys()]) {
       this.remotes.delete(id);
@@ -179,8 +199,13 @@ export class Net {
       this.onPoiGone?.(id);
     }
     this.beacons.clear();
+    this.guns.clear();
+    if (this.ownGun) {
+      this.ownGun = null;
+      this.onGunnerEnd?.();
+    }
     this.ownCargo = 0;
-    this.onCargo?.(0);
+    this.onCargo?.(0, 0);
     if (this.ownState) {
       this.ownState = null;
       this.onOwnDespawn?.();
@@ -199,10 +224,46 @@ export class Net {
       .subscribe(`SELECT * FROM loot_poi WHERE room_id = ${this.roomId}`);
     this.beaconSub = this.conn.subscriptionBuilder()
       .subscribe(`SELECT * FROM extraction_beacon WHERE room_id = ${this.roomId}`);
+    this.gunSub = this.conn.subscriptionBuilder()
+      .subscribe(`SELECT * FROM mounted_gun WHERE room_id = ${this.roomId}`);
   }
 
-  private ingestPoi(row: { id: bigint; posX: number; posZ: number; remaining: number }): void {
-    const p: PoiInfo = { id: row.id, x: row.posX, z: row.posZ, remaining: row.remaining };
+  private gunSub: SubscriptionHandle | null = null;
+
+  private ingestGun(row: {
+    id: bigint; tramplerId: bigint; slot: number; yaw: number; pitch: number;
+    mannedBy?: Identity;
+  }): void {
+    const mine = !!(this.identity && row.mannedBy && row.mannedBy.isEqual(this.identity));
+    const g: GunInfo = {
+      id: row.id, tramplerId: row.tramplerId, slot: row.slot,
+      yaw: row.yaw, pitch: row.pitch, mine,
+    };
+    this.guns.set(row.id, g);
+    const wasMine = this.ownGun?.id === row.id;
+    if (mine) {
+      this.ownGun = g;
+    } else if (wasMine) {
+      this.ownGun = null;
+      this.onGunnerEnd?.();
+    }
+  }
+
+  private dropGun(id: bigint): void {
+    this.guns.delete(id);
+    if (this.ownGun?.id === id) {
+      this.ownGun = null;
+      this.onGunnerEnd?.();
+    }
+  }
+
+  private ingestPoi(row: {
+    id: bigint; posX: number; posZ: number; itemType: number; remaining: number;
+  }): void {
+    const p: PoiInfo = {
+      id: row.id, x: row.posX, z: row.posZ,
+      itemType: row.itemType, remaining: row.remaining,
+    };
     this.pois.set(row.id, p);
     this.onPoiChanged?.(p);
   }
@@ -232,6 +293,10 @@ export class Net {
     }));
     conn.db.projectile.onDelete((_ctx, row) => this.onProjectileGone?.(row.id));
 
+    conn.db.mounted_gun.onInsert((_ctx, row) => this.ingestGun(row));
+    conn.db.mounted_gun.onUpdate((_ctx, _old, row) => this.ingestGun(row));
+    conn.db.mounted_gun.onDelete((_ctx, row) => this.dropGun(row.id));
+
     conn.db.loot_poi.onInsert((_ctx, row) => this.ingestPoi(row));
     conn.db.loot_poi.onUpdate((_ctx, _old, row) => this.ingestPoi(row));
     conn.db.loot_poi.onDelete((_ctx, row) => {
@@ -250,23 +315,27 @@ export class Net {
 
     const recount = () => {
       if (!this.conn || !this.ownState) return;
-      let total = 0;
+      let qty = 0, value = 0;
       for (const c of this.conn.db.cargo_item.iter()) {
-        if (c.tramplerId === this.ownState.id) total += c.qty;
+        if (c.tramplerId === this.ownState.id) {
+          qty += c.qty;
+          value += c.qty * (ITEMS[Math.min(c.itemType, ITEMS.length - 1)]?.value ?? 1);
+        }
       }
-      if (total !== this.ownCargo) {
-        this.ownCargo = total;
-        this.onCargo?.(total);
+      if (qty !== this.ownCargo) {
+        this.ownCargo = qty;
+        this.onCargo?.(qty, value);
       }
     };
     conn.db.cargo_item.onInsert(recount);
     conn.db.cargo_item.onUpdate(recount);
     conn.db.cargo_item.onDelete(recount);
 
-    const vault = (row: { identity: Identity; salvage: number }) => {
+    const vault = (row: { identity: Identity; salvage: number; fortressUnlocked: boolean }) => {
       if (this.identity && row.identity.isEqual(this.identity)) {
         this.ownBanked = row.salvage;
-        this.onBanked?.(row.salvage);
+        this.fortressUnlocked = row.fortressUnlocked;
+        this.onVault?.(row.salvage, row.fortressUnlocked);
       }
     };
     conn.db.vault.onInsert((_ctx, row) => vault(row));
@@ -310,6 +379,7 @@ export class Net {
     id: bigint; owner: Identity; frameId: number; color: number;
     posX: number; posY: number; posZ: number; yaw: number; speed: number;
     gunYaw: number; gunPitch: number; hpHull: number; hpEngine: number;
+    protectedUntil: { toMillis(): bigint };
   }): void {
     const snap: PoseSnapshot = {
       t: performance.now(),
@@ -322,10 +392,11 @@ export class Net {
       this.ownState = {
         ...snap, id: row.id, frameId: row.frameId, color: row.color,
         hpHull: row.hpHull, hpEngine: row.hpEngine,
+        protectedUntilMs: Number(row.protectedUntil.toMillis()),
       };
       if (isNew) {
         this.ownCargo = 0;
-        this.onCargo?.(0);
+        this.onCargo?.(0, 0);
         this.onOwnSpawn?.(snap, row.frameId, row.color);
       }
       this.onOwnHp?.(row.hpHull, row.hpEngine);
@@ -337,7 +408,8 @@ export class Net {
       r = {
         id: row.id, frameId: row.frameId, color: row.color,
         gunYaw: row.gunYaw, gunPitch: row.gunPitch,
-        hpHull: row.hpHull, hpEngine: row.hpEngine, buffer: [],
+        hpHull: row.hpHull, hpEngine: row.hpEngine,
+        protectedUntilMs: 0, buffer: [],
       };
       this.remotes.set(row.id, r);
     }
@@ -345,6 +417,7 @@ export class Net {
     r.gunPitch = row.gunPitch;
     r.hpHull = row.hpHull;
     r.hpEngine = row.hpEngine;
+    r.protectedUntilMs = Number(row.protectedUntil.toMillis());
     r.buffer.push(snap);
     const cutoff = snap.t - BUFFER_KEEP_MS;
     while (r.buffer.length > 2 && r.buffer[0].t < cutoff) r.buffer.shift();
@@ -415,6 +488,47 @@ export class Net {
   callExtraction(): Promise<void> {
     if (!this.conn) return Promise.reject(new Error('offline'));
     return this.conn.reducers.callExtraction({});
+  }
+
+  mountGun(): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.mountGun({});
+  }
+
+  dismount(): void {
+    this.conn?.reducers.dismount({}).catch(() => {});
+  }
+
+  private lastAimSent = 0;
+  private lastAimYaw = NaN;
+  private lastAimPitch = NaN;
+
+  /** Gunner aim send, rate-limited like driver input. */
+  sendGunAim(yaw: number, pitch: number, now: number): void {
+    if (!this.conn || !this.connected || !this.ownGun) return;
+    const changed = Math.abs(yaw - this.lastAimYaw) > 0.02
+      || Math.abs(pitch - this.lastAimPitch) > 0.02;
+    const due = now - this.lastAimSent > 1000 / INPUT_SEND_HZ;
+    if (!changed || !due) return;
+    this.lastAimYaw = yaw;
+    this.lastAimPitch = pitch;
+    this.lastAimSent = now;
+    this.conn.reducers.aimGun({ yaw, pitch }).catch(() => {});
+  }
+
+  fireGun(yaw: number, pitch: number): void {
+    if (!this.conn || !this.connected) return;
+    this.conn.reducers.fireGun({ yaw, pitch }).catch(() => {});
+  }
+
+  buyFortress(): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.buyFortress({});
+  }
+
+  fieldRepair(): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.fieldRepair({});
   }
 
   createRoom(name: string): Promise<void> {

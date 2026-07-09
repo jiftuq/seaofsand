@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { terrainH } from './terrain';
-import { FRAMES } from './frames';
+import { FRAMES, GUN_SLOT_OFFSETS } from './frames';
 
 // N-leg walker: two-bone IK (law of cosines), tripod gait, feet planted in
 // world space. Purely cosmetic — the server only ever syncs pos/yaw/speed;
@@ -82,12 +82,15 @@ export class Walker {
   private stackTip: THREE.Mesh;
   private smokeT = 0;
   private steerAbs = 0;
+  private frameScale: number;
+  private gunMounts = new Map<number, { yaw: THREE.Group; pitch: THREE.Group; muzzle: THREE.Object3D }>();
 
   constructor(private scene: THREE.Scene, frameId = 1, color?: number) {
     const frame = FRAMES[Math.min(frameId, FRAMES.length - 1)];
     const s = frame.scale;
     const legScale = Math.sqrt(s);
     this.maxSpd = frame.maxSpd;
+    this.frameScale = s;
     this.l1 = BASE_L1 * legScale;
     this.l2 = BASE_L2 * legScale;
     this.clearance = BASE_CLEARANCE * legScale;
@@ -307,6 +310,43 @@ export class Walker {
       this.stackTip.getWorldPosition(sp);
       this.onSmokePuff?.(sp);
     }
+  }
+
+  /** Pose a crew gun station, creating its mesh on first use. */
+  setGunAim(slot: number, yaw: number, pitch: number, lerp = 0.15): void {
+    let g = this.gunMounts.get(slot);
+    if (!g) {
+      const s = this.frameScale;
+      const [ox, oy, oz] = GUN_SLOT_OFFSETS[Math.min(slot, GUN_SLOT_OFFSETS.length - 1)];
+      const yawG = new THREE.Group();
+      yawG.position.set(ox * s, oy * s, oz * s);
+      this.bodyRig.add(yawG);
+      const base = new THREE.Mesh(new THREE.BoxGeometry(1.1 * s, 0.6 * s, 1.1 * s), mats.dark);
+      base.castShadow = true;
+      yawG.add(base);
+      const pitchG = new THREE.Group();
+      pitchG.position.y = 0.4 * s;
+      yawG.add(pitchG);
+      const barrel = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.12 * s, 0.16 * s, 3.0 * s, 8), mats.brass);
+      barrel.rotation.x = Math.PI / 2;
+      barrel.position.z = 1.5 * s;
+      barrel.castShadow = true;
+      pitchG.add(barrel);
+      const muzzle = new THREE.Object3D();
+      muzzle.position.set(0, 0, 3.0 * s);
+      pitchG.add(muzzle);
+      g = { yaw: yawG, pitch: pitchG, muzzle };
+      this.gunMounts.set(slot, g);
+    }
+    g.yaw.rotation.y = THREE.MathUtils.lerp(g.yaw.rotation.y, yaw, lerp);
+    g.pitch.rotation.x = THREE.MathUtils.lerp(g.pitch.rotation.x, pitch, lerp);
+  }
+
+  gunMuzzleWorld(slot: number): THREE.Vector3 | null {
+    const g = this.gunMounts.get(slot);
+    if (!g) return null;
+    return g.muzzle.getWorldPosition(new THREE.Vector3());
   }
 
   aimTurret(mouseX: number, mouseY: number): void {

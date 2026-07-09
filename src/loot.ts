@@ -1,13 +1,14 @@
 import * as THREE from 'three';
 import { terrainH } from './terrain';
+import { ITEMS } from './frames';
 import type { PoiInfo } from './net';
 
-// Salvage site visuals: a half-buried cargo scatter plus a tall amber light
-// beam so sites read from across the dunes. Driven by net POI events.
+// Salvage site visuals: a half-buried cargo scatter plus a tall light beam
+// colored by salvage tier so sites read from across the dunes.
 
-const beamMat = new THREE.MeshBasicMaterial({
-  color: 0xe8b04a, transparent: true, opacity: 0.16, depthWrite: false,
-});
+const beamMats = ITEMS.map(it => new THREE.MeshBasicMaterial({
+  color: it.beam, transparent: true, opacity: 0.16, depthWrite: false,
+}));
 const crateMat = new THREE.MeshStandardMaterial({ color: 0x6b5a38, roughness: .9, metalness: .3 });
 const scrapMat = new THREE.MeshStandardMaterial({ color: 0x4a4640, roughness: .95, metalness: .4 });
 
@@ -23,7 +24,9 @@ export class LootSites {
       const y = terrainH(p.x, p.z);
       g.position.set(p.x, y, p.z);
 
-      const beam = new THREE.Mesh(new THREE.CylinderGeometry(0.5, 2.0, 34, 10, 1, true), beamMat);
+      const beam = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.5, 2.0, 34, 10, 1, true),
+        beamMats[Math.min(p.itemType, beamMats.length - 1)]);
       beam.position.y = 17;
       beam.name = 'beam';
       g.add(beam);

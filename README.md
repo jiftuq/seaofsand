@@ -98,6 +98,21 @@ How it syncs, per the handoff contract:
       row and persists between runs (shown in the lobby header); dying
       loses everything aboard — the vault is only ever credited by a
       successful extraction.
+- [x] **Post-M5 — Depth pass**:
+  - *Spawn protection*: 8s shield after every spawn (HUD countdown);
+    shells bounce off, and opening fire forfeits it early.
+  - *Salvage tiers*: scrap ×1 / alloy ×3 / relic ×8 value; sites carry a
+    tier (beam colored amber/blue/violet) and stock 25/15/8; vault credit
+    and kill-drops are value-weighted.
+  - *Spending*: the FORTRESS frame is locked until bought for 100 banked
+    salvage (click its lobby card); R field-repairs the hull to full for
+    15 banked salvage.
+  - *Crew stations*: TRAMPLER MK.I carries 1 mounted gun, FORTRESS 2.
+    "CREW GUN" in the lobby mounts a free station instead of piloting:
+    the camera rides the host, mouse aims your gun (visible to everyone),
+    click fires lighter shells (12 dmg, 0.6s). Host death or despawn
+    returns the gunner to the lobby. Deck-walking (`move_local`) remains
+    future work.
 - [ ] **M3 — Combat** (server-authoritative projectiles, hull/engine HP)
 - [ ] **M4 — Loot + extraction**
 - [ ] **M5 — Stakes** (persistent loot per Identity)

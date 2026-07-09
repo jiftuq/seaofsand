@@ -5,12 +5,14 @@ export class Input {
   onFire?: () => void;
   onLoot?: () => void;
   onExtract?: () => void;
+  onRepair?: () => void;
 
   constructor() {
     addEventListener('keydown', e => {
       if (e.repeat) return;
       if (e.code === 'KeyE') this.onLoot?.();
       if (e.code === 'KeyX') this.onExtract?.();
+      if (e.code === 'KeyR') this.onRepair?.();
     });
     addEventListener('keydown', e => { this.keys[e.code] = true; });
     addEventListener('keyup', e => { this.keys[e.code] = false; });

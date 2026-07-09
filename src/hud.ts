@@ -28,7 +28,9 @@ export class Hud {
   private cargo = document.getElementById('cargo')!;
   private extract = document.getElementById('extract')!;
 
-  setCargo(qty: number): void { this.cargo.textContent = String(qty); }
+  setCargo(qty: number, value = qty): void {
+    this.cargo.textContent = qty === value ? String(qty) : `${qty} (worth ${value})`;
+  }
 
   /** context line: extraction countdown or nearby-loot hint ('' to clear) */
   setContext(text: string): void { this.extract.textContent = text; }

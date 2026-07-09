@@ -15,5 +15,6 @@ export default __t.row({
   roomId: __t.u64().name("room_id"),
   posX: __t.f32().name("pos_x"),
   posZ: __t.f32().name("pos_z"),
+  itemType: __t.u16().name("item_type"),
   remaining: __t.u16(),
 });

@@ -11,7 +11,12 @@ import {
 } from "spacetimedb";
 
 export default __t.row({
-  identity: __t.identity().primaryKey(),
-  salvage: __t.u32(),
-  fortressUnlocked: __t.bool().name("fortress_unlocked"),
+  id: __t.u64().primaryKey(),
+  roomId: __t.u64().name("room_id"),
+  tramplerId: __t.u64().name("trampler_id"),
+  slot: __t.u8(),
+  yaw: __t.f32(),
+  pitch: __t.f32(),
+  mannedBy: __t.option(__t.identity()).name("manned_by"),
+  lastFire: __t.timestamp().name("last_fire"),
 });

@@ -34,12 +34,18 @@ import {
 } from "spacetimedb";
 
 // Import all reducer arg schemas
+import AimGunReducer from "./aim_gun_reducer";
+import BuyFortressReducer from "./buy_fortress_reducer";
 import CallExtractionReducer from "./call_extraction_reducer";
 import CreateRoomReducer from "./create_room_reducer";
+import DismountReducer from "./dismount_reducer";
+import FieldRepairReducer from "./field_repair_reducer";
 import FireReducer from "./fire_reducer";
+import FireGunReducer from "./fire_gun_reducer";
 import JoinReducer from "./join_reducer";
 import JoinRoomReducer from "./join_room_reducer";
 import LootReducer from "./loot_reducer";
+import MountGunReducer from "./mount_gun_reducer";
 import SetInputReducer from "./set_input_reducer";
 import SpawnTramplerReducer from "./spawn_trampler_reducer";
 
@@ -49,6 +55,7 @@ import SpawnTramplerReducer from "./spawn_trampler_reducer";
 import CargoItemRow from "./cargo_item_table";
 import ExtractionBeaconRow from "./extraction_beacon_table";
 import LootPoiRow from "./loot_poi_table";
+import MountedGunRow from "./mounted_gun_table";
 import PlayerRow from "./player_table";
 import ProjectileRow from "./projectile_table";
 import RoomRow from "./room_table";
@@ -101,6 +108,23 @@ const tablesSchema = __schema({
       { name: 'loot_poi_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, LootPoiRow),
+  mounted_gun: __table({
+    name: 'mounted_gun',
+    indexes: [
+      { accessor: 'id', name: 'mounted_gun_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'room_id', name: 'mounted_gun_room_id_idx_btree', algorithm: 'btree', columns: [
+        'roomId',
+      ] },
+      { accessor: 'trampler_id', name: 'mounted_gun_trampler_id_idx_btree', algorithm: 'btree', columns: [
+        'tramplerId',
+      ] },
+    ],
+    constraints: [
+      { name: 'mounted_gun_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, MountedGunRow),
   player: __table({
     name: 'player',
     indexes: [
@@ -166,12 +190,18 @@ const tablesSchema = __schema({
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
+  __reducerSchema("aim_gun", AimGunReducer),
+  __reducerSchema("buy_fortress", BuyFortressReducer),
   __reducerSchema("call_extraction", CallExtractionReducer),
   __reducerSchema("create_room", CreateRoomReducer),
+  __reducerSchema("dismount", DismountReducer),
+  __reducerSchema("field_repair", FieldRepairReducer),
   __reducerSchema("fire", FireReducer),
+  __reducerSchema("fire_gun", FireGunReducer),
   __reducerSchema("join", JoinReducer),
   __reducerSchema("join_room", JoinRoomReducer),
   __reducerSchema("loot", LootReducer),
+  __reducerSchema("mount_gun", MountGunReducer),
   __reducerSchema("set_input", SetInputReducer),
   __reducerSchema("spawn_trampler", SpawnTramplerReducer),
 );

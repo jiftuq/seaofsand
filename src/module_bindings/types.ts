@@ -31,9 +31,22 @@ export const LootPoi = __t.object("LootPoi", {
   roomId: __t.u64(),
   posX: __t.f32(),
   posZ: __t.f32(),
+  itemType: __t.u16(),
   remaining: __t.u16(),
 });
 export type LootPoi = __Infer<typeof LootPoi>;
+
+export const MountedGun = __t.object("MountedGun", {
+  id: __t.u64(),
+  roomId: __t.u64(),
+  tramplerId: __t.u64(),
+  slot: __t.u8(),
+  yaw: __t.f32(),
+  pitch: __t.f32(),
+  mannedBy: __t.option(__t.identity()),
+  lastFire: __t.timestamp(),
+});
+export type MountedGun = __Infer<typeof MountedGun>;
 
 export const Player = __t.object("Player", {
   identity: __t.identity(),
@@ -57,6 +70,7 @@ export const Projectile = __t.object("Projectile", {
   velX: __t.f32(),
   velY: __t.f32(),
   velZ: __t.f32(),
+  dmg: __t.u16(),
   spawned: __t.timestamp(),
 });
 export type Projectile = __Infer<typeof Projectile>;
@@ -96,12 +110,14 @@ export const Trampler = __t.object("Trampler", {
   lastFire: __t.timestamp(),
   lastLoot: __t.timestamp(),
   diedAt: __t.option(__t.timestamp()),
+  protectedUntil: __t.timestamp(),
 });
 export type Trampler = __Infer<typeof Trampler>;
 
 export const Vault = __t.object("Vault", {
   identity: __t.identity(),
   salvage: __t.u32(),
+  fortressUnlocked: __t.bool(),
 });
 export type Vault = __Infer<typeof Vault>;
 

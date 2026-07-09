@@ -1,4 +1,4 @@
-import { FRAMES, HULL_COLORS } from './frames';
+import { FRAMES, FORTRESS_COST, HULL_COLORS } from './frames';
 import type { RoomInfo } from './net';
 
 // Homepage overlay: callsign, frame + paint selection, expedition (room)
@@ -24,10 +24,15 @@ export class Lobby {
   private frameId = 1;
   private color = HULL_COLORS[0];
   private rooms: RoomInfo[] = [];
+  private fortressUnlocked = false;
+  private banked = 0;
 
-  /** enter the given room (open desert = 0n) with the chosen loadout */
+  /** enter the given room (open desert = 1n) with the chosen loadout */
   onEnter?: (roomId: bigint, loadout: Loadout) => void;
   onCreate?: (roomName: string, loadout: Loadout) => void;
+  /** crew a free gun station in the given room instead of piloting */
+  onEnterGunner?: (roomId: bigint, name: string) => void;
+  onBuyFortress?: () => void;
 
   constructor() {
     this.callsignEl.value = localStorage.getItem('callsign')
@@ -35,14 +40,21 @@ export class Lobby {
     this.frameId = Number(localStorage.getItem('frameId') ?? 1);
     this.color = Number(localStorage.getItem('hullColor') ?? HULL_COLORS[0]);
 
-    FRAMES.forEach((f, i) => {
+    FRAMES.forEach((_f, i) => {
       const d = document.createElement('div');
       d.className = 'frame';
-      d.innerHTML = `<div class="fname">${f.name}</div>
-        <div class="fdesc">${f.desc}<br>spd ${f.maxSpd} · hp ${f.hp}</div>`;
-      d.onclick = () => { this.frameId = i; this.refreshSelection(); };
+      d.onclick = () => {
+        if (i === 2 && !this.fortressUnlocked) {
+          if (this.banked >= FORTRESS_COST) this.onBuyFortress?.();
+          else this.setStatus(`fortress costs ${FORTRESS_COST} banked salvage`);
+          return;
+        }
+        this.frameId = i;
+        this.refreshSelection();
+      };
       this.framesEl.appendChild(d);
     });
+    this.renderFrames();
     HULL_COLORS.forEach(c => {
       const s = document.createElement('div');
       s.className = 'swatch';
@@ -54,6 +66,8 @@ export class Lobby {
 
     document.getElementById('enterDesert')!.onclick =
       () => this.onEnter?.(OPEN_DESERT, this.loadout());
+    document.getElementById('desertGunner')!.onclick =
+      () => this.onEnterGunner?.(OPEN_DESERT, this.loadout().name);
     document.getElementById('createRoom')!.onclick = () => {
       const name = this.roomNameEl.value.trim();
       if (!name) { this.setStatus('name your expedition first'); return; }
@@ -62,6 +76,28 @@ export class Lobby {
     addEventListener('keydown', e => {
       if (e.code === 'Escape' && this.el.classList.contains('hidden')) this.show();
     });
+  }
+
+  private renderFrames(): void {
+    FRAMES.forEach((f, i) => {
+      const d = this.framesEl.children[i] as HTMLElement;
+      const locked = i === 2 && !this.fortressUnlocked;
+      const lockLine = locked
+        ? `<br><span style="color:#fff">LOCKED — ${FORTRESS_COST} SALVAGE${this.banked >= FORTRESS_COST ? ' · CLICK TO BUY' : ''}</span>`
+        : '';
+      d.innerHTML = `<div class="fname">${locked ? '🔒 ' : ''}${f.name}</div>
+        <div class="fdesc">${f.desc}<br>spd ${f.maxSpd} · hp ${f.hp}${lockLine}</div>`;
+      d.style.opacity = locked ? '0.75' : '1';
+    });
+    if (!this.fortressUnlocked && this.frameId === 2) this.frameId = 1;
+    this.refreshSelection();
+  }
+
+  setVault(banked: number, fortressUnlocked: boolean): void {
+    this.banked = banked;
+    this.fortressUnlocked = fortressUnlocked;
+    this.setBanked(banked);
+    this.renderFrames();
   }
 
   private loadout(): Loadout {
@@ -88,8 +124,15 @@ export class Lobby {
       const full = r.players >= r.maxPlayers;
       d.className = full ? 'room full' : 'room';
       d.innerHTML = `<span class="rname">${escapeHtml(r.name)}</span>
-        <span class="rcount">${r.players}/${r.maxPlayers}</span>`;
-      if (!full) d.onclick = () => this.onEnter?.(r.id, this.loadout());
+        <span><span class="gunchip">CREW GUN</span> <span class="rcount">${r.players}/${r.maxPlayers}</span></span>`;
+      if (!full) {
+        d.querySelector('.rname')!.addEventListener('click',
+          () => this.onEnter?.(r.id, this.loadout()));
+        d.querySelector('.gunchip')!.addEventListener('click', e => {
+          e.stopPropagation();
+          this.onEnterGunner?.(r.id, this.loadout().name);
+        });
+      }
       this.roomsEl.appendChild(d);
     }
     const desert = rooms.find(r => r.id === OPEN_DESERT);

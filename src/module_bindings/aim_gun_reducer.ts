@@ -10,8 +10,7 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
-export default __t.row({
-  identity: __t.identity().primaryKey(),
-  salvage: __t.u32(),
-  fortressUnlocked: __t.bool().name("fortress_unlocked"),
-});
+export default {
+  yaw: __t.f32(),
+  pitch: __t.f32(),
+};
