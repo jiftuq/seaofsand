@@ -10,6 +10,31 @@ import {
   type Infer as __Infer,
 } from "spacetimedb";
 
+export const CargoItem = __t.object("CargoItem", {
+  id: __t.u64(),
+  tramplerId: __t.u64(),
+  itemType: __t.u16(),
+  qty: __t.u16(),
+});
+export type CargoItem = __Infer<typeof CargoItem>;
+
+export const ExtractionBeacon = __t.object("ExtractionBeacon", {
+  id: __t.u64(),
+  roomId: __t.u64(),
+  tramplerId: __t.u64(),
+  endsAt: __t.timestamp(),
+});
+export type ExtractionBeacon = __Infer<typeof ExtractionBeacon>;
+
+export const LootPoi = __t.object("LootPoi", {
+  id: __t.u64(),
+  roomId: __t.u64(),
+  posX: __t.f32(),
+  posZ: __t.f32(),
+  remaining: __t.u16(),
+});
+export type LootPoi = __Infer<typeof LootPoi>;
+
 export const Player = __t.object("Player", {
   identity: __t.identity(),
   name: __t.string(),
@@ -69,6 +94,7 @@ export const Trampler = __t.object("Trampler", {
   gunYaw: __t.f32(),
   gunPitch: __t.f32(),
   lastFire: __t.timestamp(),
+  lastLoot: __t.timestamp(),
   diedAt: __t.option(__t.timestamp()),
 });
 export type Trampler = __Infer<typeof Trampler>;

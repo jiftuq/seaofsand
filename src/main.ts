@@ -7,6 +7,7 @@ import { Hud } from './hud';
 import { Input } from './input';
 import { Net } from './net';
 import { Lobby, type Loadout } from './lobby';
+import { LootSites } from './loot';
 
 // ---------- scene ----------
 const scene = new THREE.Scene();
@@ -40,6 +41,8 @@ const combat = new Combat(scene, effects, hud);
 const input = new Input();
 const lobby = new Lobby();
 const net = new Net();
+const lootSites = new LootSites(scene);
+const greenSmoke = new THREE.MeshBasicMaterial({ color: 0x3aa050, transparent: true });
 
 let walker: Walker | null = null;          // own trampler (null until spawned)
 const remoteWalkers = new Map<bigint, Walker>();
@@ -62,6 +65,35 @@ function buildOwnWalker(frameId: number, color: number): Walker {
 }
 
 let offline = false;
+
+const LOOT_RANGE = 18;
+
+function nearestPoi(): { id: bigint; dist: number; remaining: number } | null {
+  if (!walker) return null;
+  let best: { id: bigint; dist: number; remaining: number } | null = null;
+  for (const p of net.pois.values()) {
+    const d = Math.hypot(p.x - walker.root.position.x, p.z - walker.root.position.z);
+    if (!best || d < best.dist) best = { id: p.id, dist: d, remaining: p.remaining };
+  }
+  return best;
+}
+
+input.onLoot = () => {
+  if (!walker || walker.dead || lobby.visible) return;
+  if (offline) { hud.flash('NO LINK — NOTHING TO SALVAGE'); return; }
+  const poi = nearestPoi();
+  if (!poi || poi.dist > LOOT_RANGE) { hud.flash('NO SALVAGE IN RANGE'); return; }
+  net.loot(poi.id).catch(e =>
+    hud.flash(String(e?.message ?? e).toUpperCase()));
+};
+
+input.onExtract = () => {
+  if (!walker || walker.dead || lobby.visible) return;
+  if (offline) { hud.flash('NO LINK — NO EXTRACTION'); return; }
+  net.callExtraction()
+    .then(() => hud.flash('BEACON LIT — SURVIVE 60 SECONDS'))
+    .catch(e => hud.flash(String(e?.message ?? e).toUpperCase()));
+};
 
 input.onFire = () => {
   if (!walker || walker.dead || lobby.visible || !combat.canFire) return;
@@ -115,6 +147,19 @@ net.onRoomChanged = () => {
 };
 net.onProjectileSpawn = p => combat.onSpawn(p);
 net.onProjectileGone = id => combat.onGone(id);
+net.onPoiChanged = p => lootSites.upsert(p);
+net.onPoiGone = id => lootSites.remove(id);
+net.onCargo = qty => hud.setCargo(qty);
+net.onOwnExtracted = () => {
+  walker?.dispose();
+  walker = null;
+  hud.flash('EXTRACTION COMPLETE — SALVAGE SECURED');
+  effects.thud(90, 1.2, 0.6);
+  window.setTimeout(() => {
+    lobby.show();
+    lobby.setStatus('extraction complete — salvage secured');
+  }, 3000);
+};
 
 // dev builds default to a local spacetime instance, production to Maincloud;
 // override either with VITE_STDB_URI / VITE_STDB_DB at build time
@@ -156,6 +201,7 @@ lobby.onCreate = (roomName, loadout) => {
 // ---------- main loop ----------
 const clock = new THREE.Clock();
 const SNAP_DIST = 8; // metres of divergence before we hard-snap to the server
+let beaconSmokeT = 0;
 
 function lerpAngle(a: number, b: number, t: number): number {
   let d = (b - a) % (Math.PI * 2);
@@ -223,6 +269,38 @@ function animate(): void {
     rw.turretPitch.rotation.x = THREE.MathUtils.lerp(
       rw.turretPitch.rotation.x, remote.gunPitch, 0.15);
     rw.animate(dt);
+  }
+
+  // extraction beacons: a green smoke column marks each burning trampler
+  beaconSmokeT -= dt;
+  if (beaconSmokeT <= 0 && net.beacons.size > 0) {
+    beaconSmokeT = 0.13;
+    for (const b of net.beacons.values()) {
+      let pos: THREE.Vector3 | null = null;
+      if (net.ownState && b.tramplerId === net.ownState.id && walker) {
+        pos = walker.root.position;
+      } else {
+        const rw = remoteWalkers.get(b.tramplerId);
+        if (rw) pos = rw.root.position;
+      }
+      if (pos) {
+        effects.spawnBurst(pos.clone().add(new THREE.Vector3(0, 5, 0)), 2, greenSmoke, 1.2, 8);
+      }
+    }
+  }
+
+  // HUD context line: extraction countdown wins, else nearby-salvage hint
+  if (walker && !lobby.visible) {
+    const ownBeacon = net.ownState
+      ? [...net.beacons.values()].find(b => b.tramplerId === net.ownState!.id)
+      : undefined;
+    if (ownBeacon) {
+      const s = Math.max(0, Math.ceil((ownBeacon.endsAtMs - Date.now()) / 1000));
+      hud.setContext(`EXTRACTION T-${s}s — HOLD OUT`);
+    } else {
+      const poi = nearestPoi();
+      hud.setContext(poi && poi.dist <= LOOT_RANGE ? `[E] SALVAGE HERE (${poi.remaining})` : '');
+    }
   }
 
   combat.update(dt);

@@ -25,6 +25,14 @@ export class Hud {
     this.tgt.textContent = `hull ${hull} · engine ${engine}`;
   }
 
+  private cargo = document.getElementById('cargo')!;
+  private extract = document.getElementById('extract')!;
+
+  setCargo(qty: number): void { this.cargo.textContent = String(qty); }
+
+  /** context line: extraction countdown or nearby-loot hint ('' to clear) */
+  setContext(text: string): void { this.extract.textContent = text; }
+
   flash(text: string): void {
     this.msg.textContent = text;
     this.msg.style.opacity = '1';

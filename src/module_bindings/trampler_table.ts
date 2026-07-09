@@ -28,5 +28,6 @@ export default __t.row({
   gunYaw: __t.f32().name("gun_yaw"),
   gunPitch: __t.f32().name("gun_pitch"),
   lastFire: __t.timestamp().name("last_fire"),
+  lastLoot: __t.timestamp().name("last_loot"),
   diedAt: __t.option(__t.timestamp()).name("died_at"),
 });

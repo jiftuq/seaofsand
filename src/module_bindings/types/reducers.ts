@@ -6,17 +6,21 @@
 import { type Infer as __Infer } from "spacetimedb";
 
 // Import all reducer arg schemas
+import CallExtractionReducer from "../call_extraction_reducer";
 import CreateRoomReducer from "../create_room_reducer";
 import FireReducer from "../fire_reducer";
 import JoinReducer from "../join_reducer";
 import JoinRoomReducer from "../join_room_reducer";
+import LootReducer from "../loot_reducer";
 import SetInputReducer from "../set_input_reducer";
 import SpawnTramplerReducer from "../spawn_trampler_reducer";
 
+export type CallExtractionParams = __Infer<typeof CallExtractionReducer>;
 export type CreateRoomParams = __Infer<typeof CreateRoomReducer>;
 export type FireParams = __Infer<typeof FireReducer>;
 export type JoinParams = __Infer<typeof JoinReducer>;
 export type JoinRoomParams = __Infer<typeof JoinRoomReducer>;
+export type LootParams = __Infer<typeof LootReducer>;
 export type SetInputParams = __Infer<typeof SetInputReducer>;
 export type SpawnTramplerParams = __Infer<typeof SpawnTramplerReducer>;
 

@@ -41,6 +41,14 @@ const PROJECTILE_TTL_MICROS: i64 = 6_000_000;
 const FIRE_COOLDOWN_MICROS: i64 = 850_000; // client shows 0.9s; small grace
 const WRECK_TTL_MICROS: i64 = 30_000_000;  // dead tramplers linger 30s
 
+// loot + extraction
+const POIS_PER_ROOM: u64 = 5;
+const POI_SALVAGE: u16 = 25;
+const LOOT_RANGE: f32 = 20.0;
+const LOOT_PER_GRAB: u16 = 5;
+const LOOT_COOLDOWN_MICROS: i64 = 700_000;
+const EXTRACTION_MICROS: i64 = 60_000_000; // survive 60s under the green smoke
+
 /// Analytic dune heightfield. MUST match `terrainH` in src/terrain.ts exactly —
 /// this function is the physics on both sides of the wire.
 fn terrain_h(x: f32, z: f32) -> f32 {
@@ -82,7 +90,42 @@ pub struct Trampler {
     pub gun_yaw: f32,   // turret aim relative to hull (remote turret display)
     pub gun_pitch: f32,
     pub last_fire: Timestamp,
+    pub last_loot: Timestamp,
     pub died_at: Option<Timestamp>,
+}
+
+#[table(accessor = loot_poi, public)]
+pub struct LootPoi {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    #[index(btree)]
+    pub room_id: u64,
+    pub pos_x: f32,
+    pub pos_z: f32,
+    pub remaining: u16,
+}
+
+#[table(accessor = cargo_item, public)]
+pub struct CargoItem {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    #[index(btree)]
+    pub trampler_id: u64,
+    pub item_type: u16, // v1: 0 = salvage
+    pub qty: u16,
+}
+
+#[table(accessor = extraction_beacon, public)]
+pub struct ExtractionBeacon {
+    #[primary_key]
+    #[auto_inc]
+    pub id: u64,
+    #[index(btree)]
+    pub room_id: u64,
+    pub trampler_id: u64, // green smoke follows this trampler; survive to extract
+    pub ends_at: Timestamp,
 }
 
 #[table(accessor = projectile, public)]
@@ -139,14 +182,47 @@ pub fn init(ctx: &ReducerContext) {
         created_at: ctx.timestamp,
         max_players: MAX_PLAYERS_PER_ROOM,
     });
+    seed_pois(ctx, OPEN_DESERT);
 }
 
 fn online_count(ctx: &ReducerContext, room_id: u64) -> u32 {
     ctx.db.player().iter().filter(|p| p.online && p.room_id == room_id).count() as u32
 }
 
+/// Scatter POIS_PER_ROOM salvage sites deterministically from the room id.
+fn seed_pois(ctx: &ReducerContext, room_id: u64) {
+    for i in 0..POIS_PER_ROOM {
+        let seed = (room_id * 7919 + i * 104_729) as f32;
+        let hx = ((seed * 12.9898).sin() * 43_758.547).rem_euclid(1.0);
+        let hz = ((seed * 78.233).sin() * 43_758.547).rem_euclid(1.0);
+        ctx.db.loot_poi().insert(LootPoi {
+            id: 0,
+            room_id,
+            pos_x: hx * 280.0 - 140.0,
+            pos_z: hz * 280.0 - 140.0,
+            remaining: POI_SALVAGE,
+        });
+    }
+}
+
+fn cargo_total(ctx: &ReducerContext, trampler_id: u64) -> u16 {
+    ctx.db.cargo_item().trampler_id().filter(&trampler_id)
+        .map(|c| c.qty).sum()
+}
+
+fn drop_trampler_side_tables(ctx: &ReducerContext, trampler_id: u64) {
+    for c in ctx.db.cargo_item().trampler_id().filter(&trampler_id).collect::<Vec<_>>() {
+        ctx.db.cargo_item().id().delete(&c.id);
+    }
+    for b in ctx.db.extraction_beacon().iter().filter(|b| b.trampler_id == trampler_id)
+        .collect::<Vec<_>>() {
+        ctx.db.extraction_beacon().id().delete(&b.id);
+    }
+}
+
 fn despawn_trampler(ctx: &ReducerContext, p: &mut Player) {
     if let Some(id) = p.trampler_id.take() {
+        drop_trampler_side_tables(ctx, id);
         ctx.db.trampler().id().delete(&id);
     }
 }
@@ -204,6 +280,7 @@ pub fn create_room(ctx: &ReducerContext, name: String) -> Result<(), String> {
         created_at: ctx.timestamp,
         max_players: MAX_PLAYERS_PER_ROOM,
     });
+    seed_pois(ctx, room.id);
     despawn_trampler(ctx, &mut p);
     p.room_id = room.id;
     ctx.db.player().identity().update(p);
@@ -256,6 +333,7 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
         gun_yaw: 0.0,
         gun_pitch: 0.0,
         last_fire: Timestamp::UNIX_EPOCH,
+        last_loot: Timestamp::UNIX_EPOCH,
         died_at: None,
     });
     p.trampler_id = Some(t.id);
@@ -323,6 +401,74 @@ pub fn fire(ctx: &ReducerContext, gun_yaw: f32, gun_pitch: f32) -> Result<(), St
     t.gun_pitch = gp;
     t.last_fire = ctx.timestamp;
     ctx.db.trampler().id().update(t);
+    Ok(())
+}
+
+#[reducer]
+pub fn loot(ctx: &ReducerContext, poi_id: u64) -> Result<(), String> {
+    let p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+    let id = p.trampler_id.ok_or("no trampler")?;
+    let mut t = ctx.db.trampler().id().find(id).ok_or("trampler gone")?;
+    if t.hp_engine == 0 {
+        return Err("trampler is dead".into());
+    }
+    let elapsed = ctx.timestamp.duration_since(t.last_loot)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(i64::MAX);
+    if elapsed < LOOT_COOLDOWN_MICROS {
+        return Err("cooldown".into());
+    }
+    let mut poi = ctx.db.loot_poi().id().find(poi_id).ok_or("no such site")?;
+    if poi.room_id != t.room_id {
+        return Err("wrong room".into());
+    }
+    let dx = poi.pos_x - t.pos_x;
+    let dz = poi.pos_z - t.pos_z;
+    if dx * dx + dz * dz > LOOT_RANGE * LOOT_RANGE {
+        return Err("out of range".into());
+    }
+    let take = LOOT_PER_GRAB.min(poi.remaining);
+    if take == 0 {
+        return Err("stripped clean".into());
+    }
+
+    // one salvage stack per trampler in v1
+    if let Some(mut stack) = ctx.db.cargo_item().trampler_id().filter(&id)
+        .find(|c| c.item_type == 0) {
+        stack.qty += take;
+        ctx.db.cargo_item().id().update(stack);
+    } else {
+        ctx.db.cargo_item().insert(CargoItem { id: 0, trampler_id: id, item_type: 0, qty: take });
+    }
+
+    poi.remaining -= take;
+    if poi.remaining == 0 {
+        ctx.db.loot_poi().id().delete(&poi.id);
+    } else {
+        ctx.db.loot_poi().id().update(poi);
+    }
+    t.last_loot = ctx.timestamp;
+    ctx.db.trampler().id().update(t);
+    Ok(())
+}
+
+#[reducer]
+pub fn call_extraction(ctx: &ReducerContext) -> Result<(), String> {
+    let p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+    let id = p.trampler_id.ok_or("no trampler")?;
+    let t = ctx.db.trampler().id().find(id).ok_or("trampler gone")?;
+    if t.hp_engine == 0 {
+        return Err("trampler is dead".into());
+    }
+    if ctx.db.extraction_beacon().iter().any(|b| b.trampler_id == id) {
+        return Err("beacon already burning".into());
+    }
+    ctx.db.extraction_beacon().insert(ExtractionBeacon {
+        id: 0,
+        room_id: t.room_id,
+        trampler_id: id,
+        ends_at: ctx.timestamp + TimeDuration::from_micros(EXTRACTION_MICROS),
+    });
     Ok(())
 }
 
@@ -410,6 +556,19 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
                             t.throttle = 0.0;
                             t.steer = 0.0;
                             t.speed = 0.0;
+                            // the kill drops the victim's cargo as a fresh
+                            // salvage site at the wreck; beacon burns out
+                            let dropped = cargo_total(ctx, t.id);
+                            drop_trampler_side_tables(ctx, t.id);
+                            if dropped > 0 {
+                                ctx.db.loot_poi().insert(LootPoi {
+                                    id: 0,
+                                    room_id: t.room_id,
+                                    pos_x: t.pos_x,
+                                    pos_z: t.pos_z,
+                                    remaining: dropped,
+                                });
+                            }
                         }
                     }
                     ctx.db.trampler().id().update(t);
@@ -425,6 +584,29 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
         }
     }
 
+    // extraction beacons: orphaned ones burn out; surviving to ends_at wins —
+    // the trampler and its cargo lift off (cargo banking lands with M5)
+    for b in ctx.db.extraction_beacon().iter().collect::<Vec<_>>() {
+        let Some(t) = ctx.db.trampler().id().find(b.trampler_id) else {
+            ctx.db.extraction_beacon().id().delete(&b.id);
+            continue;
+        };
+        if t.hp_engine == 0 {
+            ctx.db.extraction_beacon().id().delete(&b.id);
+            continue;
+        }
+        if ctx.timestamp >= b.ends_at {
+            if let Some(mut p) = ctx.db.player().identity().find(t.owner) {
+                if p.trampler_id == Some(t.id) {
+                    p.trampler_id = None;
+                    ctx.db.player().identity().update(p);
+                }
+            }
+            drop_trampler_side_tables(ctx, t.id);
+            ctx.db.trampler().id().delete(&t.id);
+        }
+    }
+
     // reap player-founded rooms that have been empty for a minute
     let now = ctx.timestamp;
     let doomed: Vec<u64> = ctx.db.room().iter()
@@ -437,10 +619,14 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
         .collect();
     for id in doomed {
         for t in ctx.db.trampler().room_id().filter(&id).collect::<Vec<_>>() {
+            drop_trampler_side_tables(ctx, t.id);
             ctx.db.trampler().id().delete(&t.id);
         }
         for pr in ctx.db.projectile().room_id().filter(&id).collect::<Vec<_>>() {
             ctx.db.projectile().id().delete(&pr.id);
+        }
+        for poi in ctx.db.loot_poi().room_id().filter(&id).collect::<Vec<_>>() {
+            ctx.db.loot_poi().id().delete(&poi.id);
         }
         ctx.db.room().id().delete(&id);
     }

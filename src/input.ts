@@ -3,8 +3,15 @@ export class Input {
   mouseX = 0; // NDC, -1..1
   mouseY = 0;
   onFire?: () => void;
+  onLoot?: () => void;
+  onExtract?: () => void;
 
   constructor() {
+    addEventListener('keydown', e => {
+      if (e.repeat) return;
+      if (e.code === 'KeyE') this.onLoot?.();
+      if (e.code === 'KeyX') this.onExtract?.();
+    });
     addEventListener('keydown', e => { this.keys[e.code] = true; });
     addEventListener('keyup', e => { this.keys[e.code] = false; });
     addEventListener('mousemove', e => {

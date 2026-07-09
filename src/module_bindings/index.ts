@@ -34,16 +34,21 @@ import {
 } from "spacetimedb";
 
 // Import all reducer arg schemas
+import CallExtractionReducer from "./call_extraction_reducer";
 import CreateRoomReducer from "./create_room_reducer";
 import FireReducer from "./fire_reducer";
 import JoinReducer from "./join_reducer";
 import JoinRoomReducer from "./join_room_reducer";
+import LootReducer from "./loot_reducer";
 import SetInputReducer from "./set_input_reducer";
 import SpawnTramplerReducer from "./spawn_trampler_reducer";
 
 // Import all procedure arg schemas
 
 // Import all table schema definitions
+import CargoItemRow from "./cargo_item_table";
+import ExtractionBeaconRow from "./extraction_beacon_table";
+import LootPoiRow from "./loot_poi_table";
 import PlayerRow from "./player_table";
 import ProjectileRow from "./projectile_table";
 import RoomRow from "./room_table";
@@ -53,6 +58,48 @@ import TramplerRow from "./trampler_table";
 
 /** The schema information for all tables in this module. This is defined the same was as the tables would have been defined in the server. */
 const tablesSchema = __schema({
+  cargo_item: __table({
+    name: 'cargo_item',
+    indexes: [
+      { accessor: 'id', name: 'cargo_item_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'trampler_id', name: 'cargo_item_trampler_id_idx_btree', algorithm: 'btree', columns: [
+        'tramplerId',
+      ] },
+    ],
+    constraints: [
+      { name: 'cargo_item_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, CargoItemRow),
+  extraction_beacon: __table({
+    name: 'extraction_beacon',
+    indexes: [
+      { accessor: 'id', name: 'extraction_beacon_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'room_id', name: 'extraction_beacon_room_id_idx_btree', algorithm: 'btree', columns: [
+        'roomId',
+      ] },
+    ],
+    constraints: [
+      { name: 'extraction_beacon_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, ExtractionBeaconRow),
+  loot_poi: __table({
+    name: 'loot_poi',
+    indexes: [
+      { accessor: 'id', name: 'loot_poi_id_idx_btree', algorithm: 'btree', columns: [
+        'id',
+      ] },
+      { accessor: 'room_id', name: 'loot_poi_room_id_idx_btree', algorithm: 'btree', columns: [
+        'roomId',
+      ] },
+    ],
+    constraints: [
+      { name: 'loot_poi_id_key', constraint: 'unique', columns: ['id'] },
+    ],
+  }, LootPoiRow),
   player: __table({
     name: 'player',
     indexes: [
@@ -107,10 +154,12 @@ const tablesSchema = __schema({
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */
 const reducersSchema = __reducers(
+  __reducerSchema("call_extraction", CallExtractionReducer),
   __reducerSchema("create_room", CreateRoomReducer),
   __reducerSchema("fire", FireReducer),
   __reducerSchema("join", JoinReducer),
   __reducerSchema("join_room", JoinRoomReducer),
+  __reducerSchema("loot", LootReducer),
   __reducerSchema("set_input", SetInputReducer),
   __reducerSchema("spawn_trampler", SpawnTramplerReducer),
 );
