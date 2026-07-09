@@ -90,6 +90,8 @@ export class Net {
   beacons = new Map<bigint, BeaconInfo>();
   /** Own trampler's salvage total. */
   ownCargo = 0;
+  /** Salvage banked to our Identity — survives between runs (M5). */
+  ownBanked = 0;
 
   onStatus?: (text: string) => void;
   /** Fired when the server assigns us a (new) trampler. */
@@ -104,6 +106,7 @@ export class Net {
   onPoiChanged?: (p: PoiInfo) => void;
   onPoiGone?: (id: bigint) => void;
   onCargo?: (qty: number) => void;
+  onBanked?: (salvage: number) => void;
   /** Fired when our beacon survives its full window: trampler lifts off. */
   onOwnExtracted?: () => void;
   /** Fired whenever the room list or player counts change. */
@@ -142,6 +145,7 @@ export class Net {
           .subscribe('SELECT * FROM room');
         conn.subscriptionBuilder().subscribe('SELECT * FROM player');
         conn.subscriptionBuilder().subscribe('SELECT * FROM cargo_item');
+        conn.subscriptionBuilder().subscribe('SELECT * FROM vault');
         this.subscribeRoomTramplers();
       })
       .onConnectError((_ctx, err) => {
@@ -258,6 +262,15 @@ export class Net {
     conn.db.cargo_item.onInsert(recount);
     conn.db.cargo_item.onUpdate(recount);
     conn.db.cargo_item.onDelete(recount);
+
+    const vault = (row: { identity: Identity; salvage: number }) => {
+      if (this.identity && row.identity.isEqual(this.identity)) {
+        this.ownBanked = row.salvage;
+        this.onBanked?.(row.salvage);
+      }
+    };
+    conn.db.vault.onInsert((_ctx, row) => vault(row));
+    conn.db.vault.onUpdate((_ctx, _old, row) => vault(row));
 
     const roomsChanged = () => this.emitRooms();
     conn.db.room.onInsert(roomsChanged);

@@ -104,6 +104,10 @@ export class Lobby {
   }
 
   setStatus(text: string): void { this.statusEl.textContent = text; }
+
+  setBanked(salvage: number): void {
+    document.getElementById('banked')!.textContent = String(salvage);
+  }
   show(): void { this.el.classList.remove('hidden'); this.setRooms(this.rooms); }
   hide(): void { this.el.classList.add('hidden'); }
   get visible(): boolean { return !this.el.classList.contains('hidden'); }

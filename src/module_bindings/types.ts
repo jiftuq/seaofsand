@@ -99,3 +99,9 @@ export const Trampler = __t.object("Trampler", {
 });
 export type Trampler = __Infer<typeof Trampler>;
 
+export const Vault = __t.object("Vault", {
+  identity: __t.identity(),
+  salvage: __t.u32(),
+});
+export type Vault = __Infer<typeof Vault>;
+

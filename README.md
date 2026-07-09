@@ -93,8 +93,11 @@ How it syncs, per the handoff contract:
       follows the trampler for 60s, visible to everyone in the room —
       survive the window and the trampler lifts off with its cargo. Dying
       drops your cargo as a fresh salvage site at the wreck for whoever
-      killed you. This completes the core loop; banking extracted salvage
-      per Identity is M5.
+      killed you. This completes the core loop.
+- [x] **M5 — Stakes**: extracted salvage banks to a per-Identity `Vault`
+      row and persists between runs (shown in the lobby header); dying
+      loses everything aboard — the vault is only ever credited by a
+      successful extraction.
 - [ ] **M3 — Combat** (server-authoritative projectiles, hull/engine HP)
 - [ ] **M4 — Loot + extraction**
 - [ ] **M5 — Stakes** (persistent loot per Identity)

@@ -159,6 +159,15 @@ pub struct Player {
     pub local_z: f32,
 }
 
+/// Extracted salvage banks here per Identity and persists between runs.
+/// Dying never touches the vault — cargo aboard a wreck is simply lost.
+#[table(accessor = vault, public)]
+pub struct Vault {
+    #[primary_key]
+    pub identity: Identity,
+    pub salvage: u32,
+}
+
 #[table(accessor = tick_schedule, scheduled(tick))]
 pub struct TickSchedule {
     #[primary_key]
@@ -596,6 +605,16 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
             continue;
         }
         if ctx.timestamp >= b.ends_at {
+            // bank the cargo to the owner's vault (M5: persists between runs)
+            let loot = cargo_total(ctx, t.id) as u32;
+            if loot > 0 {
+                if let Some(mut v) = ctx.db.vault().identity().find(t.owner) {
+                    v.salvage += loot;
+                    ctx.db.vault().identity().update(v);
+                } else {
+                    ctx.db.vault().insert(Vault { identity: t.owner, salvage: loot });
+                }
+            }
             if let Some(mut p) = ctx.db.player().identity().find(t.owner) {
                 if p.trampler_id == Some(t.id) {
                     p.trampler_id = None;

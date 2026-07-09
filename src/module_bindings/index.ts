@@ -53,6 +53,7 @@ import PlayerRow from "./player_table";
 import ProjectileRow from "./projectile_table";
 import RoomRow from "./room_table";
 import TramplerRow from "./trampler_table";
+import VaultRow from "./vault_table";
 
 /** Type-only namespace exports for generated type groups. */
 
@@ -150,6 +151,17 @@ const tablesSchema = __schema({
       { name: 'trampler_id_key', constraint: 'unique', columns: ['id'] },
     ],
   }, TramplerRow),
+  vault: __table({
+    name: 'vault',
+    indexes: [
+      { accessor: 'identity', name: 'vault_identity_idx_btree', algorithm: 'btree', columns: [
+        'identity',
+      ] },
+    ],
+    constraints: [
+      { name: 'vault_identity_key', constraint: 'unique', columns: ['identity'] },
+    ],
+  }, VaultRow),
 });
 
 /** The schema information for all reducers in this module. This is defined the same way as the reducers would have been defined in the server, except the body of the reducer is omitted in code generation. */

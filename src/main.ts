@@ -150,6 +150,7 @@ net.onProjectileGone = id => combat.onGone(id);
 net.onPoiChanged = p => lootSites.upsert(p);
 net.onPoiGone = id => lootSites.remove(id);
 net.onCargo = qty => hud.setCargo(qty);
+net.onBanked = salvage => lobby.setBanked(salvage);
 net.onOwnExtracted = () => {
   walker?.dispose();
   walker = null;
