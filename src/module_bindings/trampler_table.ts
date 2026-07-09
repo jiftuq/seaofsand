@@ -31,4 +31,5 @@ export default __t.row({
   lastLoot: __t.timestamp().name("last_loot"),
   diedAt: __t.option(__t.timestamp()).name("died_at"),
   protectedUntil: __t.timestamp().name("protected_until"),
+  gunsDisabledUntil: __t.timestamp().name("guns_disabled_until"),
 });

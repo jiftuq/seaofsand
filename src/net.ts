@@ -32,6 +32,18 @@ export interface RemoteTrampler {
   buffer: PoseSnapshot[];
 }
 
+export interface RaiderInfo {
+  key: string; // identity hex
+  x: number;
+  z: number;
+  yaw: number;
+  speed: number;
+  buried: boolean;
+  boarding: bigint | null;
+  boardProgress: number;
+  mine: boolean;
+}
+
 export interface GunInfo {
   id: bigint;
   tramplerId: bigint;
@@ -93,6 +105,7 @@ export class Net {
   ownState: (PoseSnapshot & {
     id: bigint; frameId: number; color: number;
     hpHull: number; hpEngine: number; protectedUntilMs: number;
+    gunsDisabledUntilMs: number;
   }) | null = null;
   /** Everyone else's tramplers in this room, keyed by id. */
   remotes = new Map<bigint, RemoteTrampler>();
@@ -105,10 +118,15 @@ export class Net {
   /** Salvage value banked to our Identity — survives between runs (M5). */
   ownBanked = 0;
   fortressUnlocked = false;
+  thopterUnlocked = false;
   /** Crew gun stations in this room, keyed by gun id. */
   guns = new Map<bigint, GunInfo>();
   /** The gun we are manning, if any (gunner mode). */
   ownGun: GunInfo | null = null;
+  /** On-foot raiders in this room, keyed by identity hex. */
+  raiders = new Map<string, RaiderInfo>();
+  /** Our own on-foot raider, when raiding on foot. */
+  ownRaider: RaiderInfo | null = null;
 
   onStatus?: (text: string) => void;
   /** Fired when the server assigns us a (new) trampler. */
@@ -123,9 +141,15 @@ export class Net {
   onPoiChanged?: (p: PoiInfo) => void;
   onPoiGone?: (id: bigint) => void;
   onCargo?: (qty: number, value: number) => void;
-  onVault?: (salvage: number, fortressUnlocked: boolean) => void;
+  onVault?: (salvage: number, fortressUnlocked: boolean, thopterUnlocked: boolean) => void;
   /** Gunner mode ended without us asking (host died/despawned). */
   onGunnerEnd?: () => void;
+  onRaiderGone?: (key: string) => void;
+  onOwnRaiderSpawn?: (r: RaiderInfo) => void;
+  /** Our raider row vanished: trampled, hijacked a helm, or we left. */
+  onOwnRaiderGone?: () => void;
+  /** Our trampler changed owner while alive: it was seized by a boarder. */
+  onOwnHijacked?: () => void;
   /** Fired when our beacon survives its full window: trampler lifts off. */
   onOwnExtracted?: () => void;
   /** Fired whenever the room list or player counts change. */
@@ -189,6 +213,7 @@ export class Net {
     this.poiSub?.unsubscribe();
     this.beaconSub?.unsubscribe();
     this.gunSub?.unsubscribe();
+    this.raiderSub?.unsubscribe();
     // drop everything from the previous room
     for (const id of [...this.remotes.keys()]) {
       this.remotes.delete(id);
@@ -200,6 +225,11 @@ export class Net {
     }
     this.beacons.clear();
     this.guns.clear();
+    for (const key of [...this.raiders.keys()]) {
+      this.raiders.delete(key);
+      this.onRaiderGone?.(key);
+    }
+    this.ownRaider = null;
     if (this.ownGun) {
       this.ownGun = null;
       this.onGunnerEnd?.();
@@ -226,6 +256,37 @@ export class Net {
       .subscribe(`SELECT * FROM extraction_beacon WHERE room_id = ${this.roomId}`);
     this.gunSub = this.conn.subscriptionBuilder()
       .subscribe(`SELECT * FROM mounted_gun WHERE room_id = ${this.roomId}`);
+    this.raiderSub = this.conn.subscriptionBuilder()
+      .subscribe(`SELECT * FROM raider WHERE room_id = ${this.roomId}`);
+  }
+
+  private raiderSub: SubscriptionHandle | null = null;
+
+  private ingestRaider(row: {
+    identity: Identity; posX: number; posZ: number; yaw: number; speed: number;
+    buried: boolean; boarding?: bigint; boardProgress: number;
+  }): void {
+    const key = row.identity.toHexString();
+    const mine = !!(this.identity && row.identity.isEqual(this.identity));
+    const r: RaiderInfo = {
+      key, x: row.posX, z: row.posZ, yaw: row.yaw, speed: row.speed,
+      buried: row.buried, boarding: row.boarding ?? null,
+      boardProgress: row.boardProgress, mine,
+    };
+    this.raiders.set(key, r);
+    if (mine) {
+      const isNew = this.ownRaider === null;
+      this.ownRaider = r;
+      if (isNew) this.onOwnRaiderSpawn?.(r);
+    }
+  }
+
+  private dropRaider(key: string): void {
+    if (this.raiders.delete(key)) this.onRaiderGone?.(key);
+    if (this.ownRaider?.key === key) {
+      this.ownRaider = null;
+      this.onOwnRaiderGone?.();
+    }
   }
 
   private gunSub: SubscriptionHandle | null = null;
@@ -293,6 +354,10 @@ export class Net {
     }));
     conn.db.projectile.onDelete((_ctx, row) => this.onProjectileGone?.(row.id));
 
+    conn.db.raider.onInsert((_ctx, row) => this.ingestRaider(row));
+    conn.db.raider.onUpdate((_ctx, _old, row) => this.ingestRaider(row));
+    conn.db.raider.onDelete((_ctx, row) => this.dropRaider(row.identity.toHexString()));
+
     conn.db.mounted_gun.onInsert((_ctx, row) => this.ingestGun(row));
     conn.db.mounted_gun.onUpdate((_ctx, _old, row) => this.ingestGun(row));
     conn.db.mounted_gun.onDelete((_ctx, row) => this.dropGun(row.id));
@@ -331,11 +396,15 @@ export class Net {
     conn.db.cargo_item.onUpdate(recount);
     conn.db.cargo_item.onDelete(recount);
 
-    const vault = (row: { identity: Identity; salvage: number; fortressUnlocked: boolean }) => {
+    const vault = (row: {
+      identity: Identity; salvage: number;
+      fortressUnlocked: boolean; thopterUnlocked: boolean;
+    }) => {
       if (this.identity && row.identity.isEqual(this.identity)) {
         this.ownBanked = row.salvage;
         this.fortressUnlocked = row.fortressUnlocked;
-        this.onVault?.(row.salvage, row.fortressUnlocked);
+        this.thopterUnlocked = row.thopterUnlocked;
+        this.onVault?.(row.salvage, row.fortressUnlocked, row.thopterUnlocked);
       }
     };
     conn.db.vault.onInsert((_ctx, row) => vault(row));
@@ -380,7 +449,15 @@ export class Net {
     posX: number; posY: number; posZ: number; yaw: number; speed: number;
     gunYaw: number; gunPitch: number; hpHull: number; hpEngine: number;
     protectedUntil: { toMillis(): bigint };
+    gunsDisabledUntil: { toMillis(): bigint };
   }): void {
+    // a boarder took our helm: our row is still alive but no longer ours
+    if (this.ownState && row.id === this.ownState.id
+        && this.identity && !row.owner.isEqual(this.identity)) {
+      this.ownState = null;
+      this.onOwnHijacked?.();
+      // fall through: it's a remote now
+    }
     const snap: PoseSnapshot = {
       t: performance.now(),
       x: row.posX, y: row.posY, z: row.posZ,
@@ -393,6 +470,7 @@ export class Net {
         ...snap, id: row.id, frameId: row.frameId, color: row.color,
         hpHull: row.hpHull, hpEngine: row.hpEngine,
         protectedUntilMs: Number(row.protectedUntil.toMillis()),
+        gunsDisabledUntilMs: Number(row.gunsDisabledUntil.toMillis()),
       };
       if (isNew) {
         this.ownCargo = 0;
@@ -453,8 +531,9 @@ export class Net {
   /** Rate-limited, change-deduplicated input + turret aim send. */
   sendInput(throttle: number, steer: number,
             gunYaw: number, gunPitch: number, now: number): void {
-    if (!this.conn || !this.connected || !this.ownState) return;
-    if (this.ownState.hpEngine === 0) return; // dead — server rejects anyway
+    if (!this.conn || !this.connected) return;
+    if (!this.ownState && !this.ownRaider) return;
+    if (this.ownState && this.ownState.hpEngine === 0) return; // dead
     // drive changes send immediately (responsiveness); aim drift is capped at
     // the send rate; a parked, still turret sends nothing at all
     const driveChanged = throttle !== this.lastThrottle || steer !== this.lastSteer;
@@ -519,6 +598,31 @@ export class Net {
   fireGun(yaw: number, pitch: number): void {
     if (!this.conn || !this.connected) return;
     this.conn.reducers.fireGun({ yaw, pitch }).catch(() => {});
+  }
+
+  spawnRaider(): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.spawnRaider({});
+  }
+
+  toggleBury(): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.toggleBury({});
+  }
+
+  board(): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.board({});
+  }
+
+  repel(): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.repel({});
+  }
+
+  buyThopter(): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.buyThopter({});
   }
 
   buyFortress(): Promise<void> {

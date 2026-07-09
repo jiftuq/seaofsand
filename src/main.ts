@@ -8,6 +8,7 @@ import { Input } from './input';
 import { Net } from './net';
 import { Lobby, type Loadout } from './lobby';
 import { LootSites } from './loot';
+import { RaiderMesh } from './raider';
 
 // ---------- scene ----------
 const scene = new THREE.Scene();
@@ -46,7 +47,10 @@ const greenSmoke = new THREE.MeshBasicMaterial({ color: 0x3aa050, transparent: t
 
 let walker: Walker | null = null;          // own trampler (null until spawned)
 const remoteWalkers = new Map<bigint, Walker>();
+const raiderMeshes = new Map<string, RaiderMesh>();
 let roomNames = new Map<bigint, string>();
+// own raider prediction (mirrors the server's on-foot integrator)
+const ownRaiderPose = { x: 0, z: 0, yaw: 0, speed: 0, active: false };
 
 function hookWalkerEffects(w: Walker): void {
   w.onFootfall = pos => {
@@ -100,6 +104,24 @@ input.onRepair = () => {
   net.fieldRepair()
     .then(() => hud.flash('HULL PATCHED — -15 SALVAGE'))
     .catch(e => hud.flash(String(e?.message ?? e).toUpperCase()));
+};
+
+input.onBoardRepel = () => {
+  if (lobby.visible) return;
+  if (net.ownRaider) {
+    net.board()
+      .then(() => hud.flash('ABOARD — HOLD ON'))
+      .catch(e => hud.flash(String(e?.message ?? e).toUpperCase()));
+  } else if (walker && !walker.dead) {
+    net.repel()
+      .then(() => hud.flash('DECK SWEPT CLEAR'))
+      .catch(() => {});
+  }
+};
+
+input.onBury = () => {
+  if (lobby.visible || !net.ownRaider) return;
+  net.toggleBury().catch(e => hud.flash(String(e?.message ?? e).toUpperCase()));
 };
 
 let gunnerCooldown = 0;
@@ -174,7 +196,43 @@ net.onProjectileGone = id => combat.onGone(id);
 net.onPoiChanged = p => lootSites.upsert(p);
 net.onPoiGone = id => lootSites.remove(id);
 net.onCargo = (qty, value) => hud.setCargo(qty, value);
-net.onVault = (salvage, unlocked) => lobby.setVault(salvage, unlocked);
+net.onVault = (salvage, fortress, thopter) => lobby.setVault(salvage, fortress, thopter);
+net.onOwnRaiderSpawn = r => {
+  ownRaiderPose.x = r.x;
+  ownRaiderPose.z = r.z;
+  ownRaiderPose.yaw = r.yaw;
+  ownRaiderPose.speed = 0;
+  ownRaiderPose.active = true;
+  hud.setRoom(roomNames.get(net.roomId) ?? 'open desert');
+  hud.setHp(1, 1);
+  lobby.hide();
+  hud.flash('ON FOOT — C BURY · F BOARD · STAY OFF THEIR PATH');
+};
+net.onOwnRaiderGone = () => {
+  ownRaiderPose.active = false;
+  if (lobby.visible) return;
+  // give a hijack-in-progress a moment to hand us the helm
+  window.setTimeout(() => {
+    if (!net.ownState && !net.ownRaider && !net.ownGun && !lobby.visible) {
+      hud.flash('TRAMPLED INTO THE SAND');
+      effects.thud(28, 1.2, 0.9);
+      window.setTimeout(() => {
+        lobby.show();
+        lobby.setStatus('trampled — the desert keeps what it takes');
+      }, 2000);
+    }
+  }, 900);
+};
+net.onOwnHijacked = () => {
+  walker?.dispose();
+  walker = null;
+  hud.flash('HELM SEIZED — YOUR TRAMPLER IS THEIRS');
+  effects.thud(25, 1.5, 0.9);
+};
+net.onRaiderGone = key => {
+  raiderMeshes.get(key)?.dispose();
+  raiderMeshes.delete(key);
+};
 net.onGunnerEnd = () => {
   if (lobby.visible) return; // we initiated it from the lobby
   hud.flash('HOST TRAMPLER LOST');
@@ -223,9 +281,16 @@ lobby.onEnter = (roomId, loadout) => {
     .then(() => net.spawn(loadout.frameId, loadout.color))
     .catch(e => lobby.setStatus(String(e?.message ?? e)));
 };
-lobby.onBuyFortress = () => {
-  net.buyFortress()
-    .then(() => lobby.setStatus('fortress unlocked'))
+lobby.onBuyFrame = frameId => {
+  const buy = frameId === 3 ? net.buyThopter() : net.buyFortress();
+  buy.then(() => lobby.setStatus('frame unlocked'))
+    .catch(e => lobby.setStatus(String(e?.message ?? e)));
+};
+lobby.onEnterRaider = (roomId, _name) => {
+  if (!net.connected) { lobby.setStatus('offline — no raids on foot'); return; }
+  lobby.setStatus('slipping into the sand…');
+  net.joinRoom(roomId)
+    .then(() => net.spawnRaider())
     .catch(e => lobby.setStatus(String(e?.message ?? e)));
 };
 lobby.onEnterGunner = (roomId, _name) => {
@@ -252,6 +317,7 @@ lobby.onCreate = (roomName, loadout) => {
 const clock = new THREE.Clock();
 const SNAP_DIST = 8; // metres of divergence before we hard-snap to the server
 let beaconSmokeT = 0;
+let boardAlarmT = 0;
 let gunnerAimYaw = 0;
 let gunnerAimPitch = 0;
 
@@ -310,6 +376,27 @@ function animate(): void {
     net.sendGunAim(gunnerAimYaw, gunnerAimPitch, now);
   }
 
+  // own raider: predict on-foot movement, reconcile toward server
+  if (net.ownRaider && ownRaiderPose.active) {
+    const r = net.ownRaider;
+    if (!r.buried && r.boarding === null) {
+      ownRaiderPose.speed += (throttle * 4.5 - ownRaiderPose.speed)
+        * Math.min(1, 10 * rawDt / Math.max(1, Math.abs(ownRaiderPose.speed)));
+      if (!throttle) ownRaiderPose.speed *= Math.pow(0.2, rawDt);
+      ownRaiderPose.yaw += steer * 2.5 * rawDt;
+      ownRaiderPose.x += Math.sin(ownRaiderPose.yaw) * ownRaiderPose.speed * rawDt;
+      ownRaiderPose.z += Math.cos(ownRaiderPose.yaw) * ownRaiderPose.speed * rawDt;
+      const k = 1 - Math.exp(-rawDt * 3);
+      ownRaiderPose.x += (r.x - ownRaiderPose.x) * k;
+      ownRaiderPose.z += (r.z - ownRaiderPose.z) * k;
+    } else {
+      ownRaiderPose.x = r.x;
+      ownRaiderPose.z = r.z;
+      ownRaiderPose.speed = 0;
+    }
+    net.sendInput(throttle, steer, 0, 0, now);
+  }
+
   // remote tramplers: interpolate + derive gait locally
   for (const [id, remote] of net.remotes) {
     let rw = remoteWalkers.get(id);
@@ -330,6 +417,41 @@ function animate(): void {
     rw.turretPitch.rotation.x = THREE.MathUtils.lerp(
       rw.turretPitch.rotation.x, remote.gunPitch, 0.15);
     rw.animate(dt);
+  }
+
+  // raiders on foot (and on decks)
+  for (const [key, r] of net.raiders) {
+    let m = raiderMeshes.get(key);
+    if (!m) {
+      m = new RaiderMesh(scene);
+      raiderMeshes.set(key, m);
+    }
+    if (r.boarding !== null) {
+      const host = net.ownState && r.boarding === net.ownState.id
+        ? walker
+        : remoteWalkers.get(r.boarding);
+      if (host) m.setAboard(host);
+    } else if (r.mine && ownRaiderPose.active) {
+      m.setGround(ownRaiderPose.x, ownRaiderPose.z, ownRaiderPose.yaw,
+        ownRaiderPose.speed, r.buried, dt);
+    } else {
+      m.setGround(r.x, r.z, r.yaw, r.speed, r.buried, dt);
+    }
+  }
+
+  // boarding alarm for pilots
+  if (walker && !walker.dead && net.ownState && !lobby.visible) {
+    const boarded = [...net.raiders.values()].some(r => r.boarding === net.ownState!.id);
+    if (boarded) {
+      boardAlarmT -= dt;
+      if (boardAlarmT <= 0) {
+        boardAlarmT = 1.6;
+        hud.flash('BOARDERS ON DECK — [F] REPEL');
+        effects.thud(120, 0.15, 0.3);
+      }
+    } else {
+      boardAlarmT = 0;
+    }
   }
 
   // crew gun stations on every hull; our own manned gun is posed locally
@@ -361,13 +483,37 @@ function animate(): void {
   }
 
   if (net.ownGun && !lobby.visible) hud.setContext('GUN STATION — CLICK FIRE · ESC LOBBY');
+  // raider context: boarding progress, bury state, board prompts
+  if (net.ownRaider && !lobby.visible) {
+    const r = net.ownRaider;
+    if (r.boarding !== null) {
+      const p = r.boardProgress;
+      hud.setContext(p < 3
+        ? `SABOTAGING… ${Math.max(0, 3 - p).toFixed(1)}s TO DISARM`
+        : `GUNS CUT — ${Math.max(0, 8 - p).toFixed(1)}s TO SEIZE THE HELM`);
+    } else if (r.buried) {
+      hud.setContext('BURIED — [C] SURFACE');
+    } else {
+      let near = Infinity;
+      for (const t of net.remotes.values()) {
+        const s = t.buffer[t.buffer.length - 1];
+        if (s && t.hpEngine > 0) {
+          near = Math.min(near, Math.hypot(s.x - ownRaiderPose.x, s.z - ownRaiderPose.z));
+        }
+      }
+      hud.setContext(near <= 8 ? '[F] BOARD THE TRAMPLER' : '[C] BURY · SNEAK CLOSE TO BOARD');
+    }
+  }
   // HUD context line: extraction countdown wins, else nearby-salvage hint
   if (walker && !lobby.visible) {
     const ownBeacon = net.ownState
       ? [...net.beacons.values()].find(b => b.tramplerId === net.ownState!.id)
       : undefined;
     const shieldMs = net.ownState ? net.ownState.protectedUntilMs - Date.now() : 0;
-    if (ownBeacon) {
+    const sabotageMs = net.ownState ? net.ownState.gunsDisabledUntilMs - Date.now() : 0;
+    if (sabotageMs > 0) {
+      hud.setContext(`WEAPONS SABOTAGED ${Math.ceil(sabotageMs / 1000)}s`);
+    } else if (ownBeacon) {
       const s = Math.max(0, Math.ceil((ownBeacon.endsAtMs - Date.now()) / 1000));
       hud.setContext(`EXTRACTION T-${s}s — HOLD OUT`);
     } else if (shieldMs > 0) {
@@ -394,6 +540,29 @@ function animate(): void {
     hud.setHeading(gunnerHost.yaw);
     const hostRec = net.remotes.get(net.ownGun!.tramplerId);
     if (hostRec) hud.setHp(hostRec.hpHull, hostRec.hpEngine);
+  } else if (net.ownRaider && ownRaiderPose.active) {
+    const r = net.ownRaider;
+    if (r.boarding !== null) {
+      const host = remoteWalkers.get(r.boarding);
+      if (host) {
+        const camOff = new THREE.Vector3(0, 13, -24)
+          .applyAxisAngle(new THREE.Vector3(0, 1, 0), host.yaw);
+        const camTarget = host.root.position.clone().add(camOff);
+        camTarget.y = Math.max(camTarget.y, terrainH(camTarget.x, camTarget.z) + 4);
+        camera.position.lerp(camTarget, 0.15);
+        camera.lookAt(host.root.position.clone().add(new THREE.Vector3(0, 4, 0)));
+      }
+    } else {
+      const gy = terrainH(ownRaiderPose.x, ownRaiderPose.z);
+      const camOff = new THREE.Vector3(0, 3.6, -8)
+        .applyAxisAngle(new THREE.Vector3(0, 1, 0), ownRaiderPose.yaw);
+      const camTarget = new THREE.Vector3(ownRaiderPose.x, gy, ownRaiderPose.z).add(camOff);
+      camTarget.y = Math.max(camTarget.y, terrainH(camTarget.x, camTarget.z) + 1.6);
+      camera.position.lerp(camTarget, 0.1);
+      camera.lookAt(ownRaiderPose.x, gy + 1.4, ownRaiderPose.z);
+    }
+    hud.setSpeed(ownRaiderPose.speed);
+    hud.setHeading(ownRaiderPose.yaw);
   } else if (walker) {
     const camOff = new THREE.Vector3(0, 9, -20)
       .applyAxisAngle(new THREE.Vector3(0, 1, 0), walker.yaw);

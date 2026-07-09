@@ -75,6 +75,22 @@ export const Projectile = __t.object("Projectile", {
 });
 export type Projectile = __Infer<typeof Projectile>;
 
+export const Raider = __t.object("Raider", {
+  identity: __t.identity(),
+  roomId: __t.u64(),
+  posX: __t.f32(),
+  posZ: __t.f32(),
+  yaw: __t.f32(),
+  speed: __t.f32(),
+  throttle: __t.f32(),
+  steer: __t.f32(),
+  buried: __t.bool(),
+  boarding: __t.option(__t.u64()),
+  boardProgress: __t.f32(),
+  disarmDone: __t.bool(),
+});
+export type Raider = __Infer<typeof Raider>;
+
 export const Room = __t.object("Room", {
   id: __t.u64(),
   name: __t.string(),
@@ -111,6 +127,7 @@ export const Trampler = __t.object("Trampler", {
   lastLoot: __t.timestamp(),
   diedAt: __t.option(__t.timestamp()),
   protectedUntil: __t.timestamp(),
+  gunsDisabledUntil: __t.timestamp(),
 });
 export type Trampler = __Infer<typeof Trampler>;
 
@@ -118,6 +135,7 @@ export const Vault = __t.object("Vault", {
   identity: __t.identity(),
   salvage: __t.u32(),
   fortressUnlocked: __t.bool(),
+  thopterUnlocked: __t.bool(),
 });
 export type Vault = __Infer<typeof Vault>;
 

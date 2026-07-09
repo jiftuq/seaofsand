@@ -7,7 +7,9 @@ import { type Infer as __Infer } from "spacetimedb";
 
 // Import all reducer arg schemas
 import AimGunReducer from "../aim_gun_reducer";
+import BoardReducer from "../board_reducer";
 import BuyFortressReducer from "../buy_fortress_reducer";
+import BuyThopterReducer from "../buy_thopter_reducer";
 import CallExtractionReducer from "../call_extraction_reducer";
 import CreateRoomReducer from "../create_room_reducer";
 import DismountReducer from "../dismount_reducer";
@@ -18,11 +20,16 @@ import JoinReducer from "../join_reducer";
 import JoinRoomReducer from "../join_room_reducer";
 import LootReducer from "../loot_reducer";
 import MountGunReducer from "../mount_gun_reducer";
+import RepelReducer from "../repel_reducer";
 import SetInputReducer from "../set_input_reducer";
+import SpawnRaiderReducer from "../spawn_raider_reducer";
 import SpawnTramplerReducer from "../spawn_trampler_reducer";
+import ToggleBuryReducer from "../toggle_bury_reducer";
 
 export type AimGunParams = __Infer<typeof AimGunReducer>;
+export type BoardParams = __Infer<typeof BoardReducer>;
 export type BuyFortressParams = __Infer<typeof BuyFortressReducer>;
+export type BuyThopterParams = __Infer<typeof BuyThopterReducer>;
 export type CallExtractionParams = __Infer<typeof CallExtractionReducer>;
 export type CreateRoomParams = __Infer<typeof CreateRoomReducer>;
 export type DismountParams = __Infer<typeof DismountReducer>;
@@ -33,6 +40,9 @@ export type JoinParams = __Infer<typeof JoinReducer>;
 export type JoinRoomParams = __Infer<typeof JoinRoomReducer>;
 export type LootParams = __Infer<typeof LootReducer>;
 export type MountGunParams = __Infer<typeof MountGunReducer>;
+export type RepelParams = __Infer<typeof RepelReducer>;
 export type SetInputParams = __Infer<typeof SetInputReducer>;
+export type SpawnRaiderParams = __Infer<typeof SpawnRaiderReducer>;
 export type SpawnTramplerParams = __Infer<typeof SpawnTramplerReducer>;
+export type ToggleBuryParams = __Infer<typeof ToggleBuryReducer>;
 

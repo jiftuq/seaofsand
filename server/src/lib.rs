@@ -23,11 +23,14 @@ const EMPTY_ROOM_TTL_MICROS: i64 = 60_000_000; // empty player-rooms live 60s
 /// max speed drives both server integration and client prediction, and
 /// scale drives muzzle offsets and hit radii.
 ///                                 max_spd hull engine scale
-const FRAME_STATS: [(f32, u16, u16, f32); 3] = [
+const FRAME_STATS: [(f32, u16, u16, f32); 4] = [
     (12.0, 60, 60, 0.75),   // 0 scout    "DUNE SKIMMER"
     (9.0, 100, 100, 1.0),   // 1 mid      "TRAMPLER MK.I"
     (6.0, 180, 160, 1.35),  // 2 fortress "FORTRESS"
+    (16.0, 30, 30, 0.6),    // 3 flyer    "ORNITHOPTER"
 ];
+const FRAME_FLYING: [bool; 4] = [false, false, false, true];
+const HOVER_HEIGHT: f32 = 12.0; // ornithopter altitude over the dunes
 
 fn frame_stats(frame_id: u32) -> (f32, u16, u16, f32) {
     FRAME_STATS[(frame_id as usize).min(FRAME_STATS.len() - 1)]
@@ -57,10 +60,22 @@ const POI_TYPE_PATTERN: [u16; 5] = [0, 0, 1, 0, 2]; // per-room site mix
 // progression + protection
 const SPAWN_SHIELD_MICROS: i64 = 8_000_000;
 const FORTRESS_COST: u32 = 100;
+const THOPTER_COST: u32 = 60;
 const REPAIR_COST: u32 = 15;
 
+// sand raiders (on foot)
+const RAIDER_SPD: f32 = 4.5;
+const RAIDER_ACCEL: f32 = 10.0;
+const RAIDER_TURN: f32 = 2.5;
+const BOARD_RANGE: f32 = 8.0;
+const DISARM_AT_SECS: f32 = 3.0;   // boarding time to sabotage the guns
+const HIJACK_AT_SECS: f32 = 8.0;   // boarding time to take the helm
+const SABOTAGE_MICROS: i64 = 45_000_000;
+const TRAMPLE_FACTOR: f32 = 3.5;   // kill radius = factor * frame scale
+const TRAMPLE_MIN_SPEED: f32 = 2.0;
+
 // mounted guns (crew stations) — slots per frame_id
-const GUN_SLOTS: [u8; 3] = [0, 1, 2];
+const GUN_SLOTS: [u8; 4] = [0, 1, 2, 0];
 const MOUNTED_DMG: u16 = 12;
 const MOUNTED_COOLDOWN_MICROS: i64 = 600_000;
 
@@ -93,6 +108,7 @@ pub struct Room {
 }
 
 #[table(accessor = trampler, public)]
+#[derive(Clone)]
 pub struct Trampler {
     #[primary_key]
     #[auto_inc]
@@ -117,6 +133,27 @@ pub struct Trampler {
     pub last_loot: Timestamp,
     pub died_at: Option<Timestamp>,
     pub protected_until: Timestamp, // spawn shield; firing forfeits it early
+    pub guns_disabled_until: Timestamp, // boarding sabotage
+}
+
+/// A player on foot. Slow, unarmed, tramplable — but can bury in the sand
+/// to hide, and board enemy tramplers to sabotage or steal them.
+#[table(accessor = raider, public)]
+pub struct Raider {
+    #[primary_key]
+    pub identity: Identity,
+    #[index(btree)]
+    pub room_id: u64,
+    pub pos_x: f32,
+    pub pos_z: f32,
+    pub yaw: f32,
+    pub speed: f32,
+    pub throttle: f32,
+    pub steer: f32,
+    pub buried: bool,          // hidden and immobile
+    pub boarding: Option<u64>, // trampler being boarded (rides its deck)
+    pub board_progress: f32,   // seconds aboard
+    pub disarm_done: bool,
 }
 
 #[table(accessor = loot_poi, public)]
@@ -211,6 +248,7 @@ pub struct Vault {
     pub identity: Identity,
     pub salvage: u32, // value units (see ITEM_VALUES), spendable
     pub fortress_unlocked: bool,
+    pub thopter_unlocked: bool,
 }
 
 fn credit_vault(ctx: &ReducerContext, identity: Identity, amount: u32) {
@@ -218,7 +256,10 @@ fn credit_vault(ctx: &ReducerContext, identity: Identity, amount: u32) {
         v.salvage += amount;
         ctx.db.vault().identity().update(v);
     } else {
-        ctx.db.vault().insert(Vault { identity, salvage: amount, fortress_unlocked: false });
+        ctx.db.vault().insert(Vault {
+            identity, salvage: amount,
+            fortress_unlocked: false, thopter_unlocked: false,
+        });
     }
 }
 
@@ -319,6 +360,7 @@ pub fn client_disconnected(ctx: &ReducerContext) {
     if let Some(mut p) = ctx.db.player().identity().find(ctx.sender()) {
         p.online = false;
         release_guns(ctx, ctx.sender());
+        ctx.db.raider().identity().delete(&ctx.sender());
         despawn_trampler(ctx, &mut p);
         p.room_id = OPEN_DESERT;
         ctx.db.player().identity().update(p);
@@ -362,6 +404,7 @@ pub fn create_room(ctx: &ReducerContext, name: String) -> Result<(), String> {
     });
     seed_pois(ctx, room.id);
     release_guns(ctx, ctx.sender());
+    ctx.db.raider().identity().delete(&ctx.sender());
     despawn_trampler(ctx, &mut p);
     p.room_id = room.id;
     ctx.db.player().identity().update(p);
@@ -379,6 +422,7 @@ pub fn join_room(ctx: &ReducerContext, room_id: u64) -> Result<(), String> {
         return Err("room is full".into());
     }
     release_guns(ctx, ctx.sender());
+    ctx.db.raider().identity().delete(&ctx.sender());
     despawn_trampler(ctx, &mut p);
     p.room_id = room_id;
     ctx.db.player().identity().update(p);
@@ -391,14 +435,18 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
     if frame_id as usize >= FRAME_STATS.len() {
         return Err("unknown frame".into());
     }
-    if frame_id == 2 {
-        let unlocked = ctx.db.vault().identity().find(ctx.sender())
-            .map(|v| v.fortress_unlocked).unwrap_or(false);
+    if frame_id >= 2 {
+        let v = ctx.db.vault().identity().find(ctx.sender());
+        let unlocked = match frame_id {
+            2 => v.map(|v| v.fortress_unlocked).unwrap_or(false),
+            _ => v.map(|v| v.thopter_unlocked).unwrap_or(false),
+        };
         if !unlocked {
-            return Err("fortress locked — buy it in the lobby".into());
+            return Err("frame locked — buy it in the lobby".into());
         }
     }
     release_guns(ctx, ctx.sender());
+    ctx.db.raider().identity().delete(&ctx.sender());
     despawn_trampler(ctx, &mut p); // respawn = replace
     let (_, hull, engine, _) = frame_stats(frame_id);
     // deterministic-ish scatter so spawns in a room don't overlap
@@ -426,6 +474,7 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
         last_loot: Timestamp::UNIX_EPOCH,
         died_at: None,
         protected_until: ctx.timestamp + TimeDuration::from_micros(SPAWN_SHIELD_MICROS),
+        guns_disabled_until: Timestamp::UNIX_EPOCH,
     });
     for slot in 0..GUN_SLOTS[frame_id as usize] {
         ctx.db.mounted_gun().insert(MountedGun {
@@ -448,7 +497,14 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
 pub fn set_input(ctx: &ReducerContext, throttle: f32, steer: f32,
                  gun_yaw: f32, gun_pitch: f32) -> Result<(), String> {
     let p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
-    let id = p.trampler_id.ok_or("no trampler")?;
+    let Some(id) = p.trampler_id else {
+        // on foot: same input stream drives the raider
+        let mut r = ctx.db.raider().identity().find(ctx.sender()).ok_or("no trampler")?;
+        r.throttle = throttle.clamp(-0.5, 1.0);
+        r.steer = steer.clamp(-1.0, 1.0);
+        ctx.db.raider().identity().update(r);
+        return Ok(());
+    };
     let mut t = ctx.db.trampler().id().find(id).ok_or("trampler gone")?;
     if t.hp_engine == 0 {
         return Err("trampler is dead".into());
@@ -468,6 +524,9 @@ pub fn fire(ctx: &ReducerContext, gun_yaw: f32, gun_pitch: f32) -> Result<(), St
     let mut t = ctx.db.trampler().id().find(id).ok_or("trampler gone")?;
     if t.hp_engine == 0 {
         return Err("trampler is dead".into());
+    }
+    if ctx.timestamp < t.guns_disabled_until {
+        return Err("weapons sabotaged".into());
     }
     let elapsed = ctx.timestamp.duration_since(t.last_fire)
         .map(|d| d.as_micros() as i64)
@@ -560,6 +619,111 @@ pub fn loot(ctx: &ReducerContext, poi_id: u64) -> Result<(), String> {
 }
 
 #[reducer]
+pub fn spawn_raider(ctx: &ReducerContext) -> Result<(), String> {
+    let mut p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+    release_guns(ctx, ctx.sender());
+    despawn_trampler(ctx, &mut p);
+    ctx.db.player().identity().update(p);
+    let p = ctx.db.player().identity().find(ctx.sender()).unwrap();
+    ctx.db.raider().identity().delete(&ctx.sender());
+    let n = ctx.db.raider().count() as f32 + p.room_id as f32 * 3.0;
+    let x = (n * 41.0) % 100.0 - 50.0;
+    let z = (n * 59.0) % 100.0 - 50.0;
+    ctx.db.raider().insert(Raider {
+        identity: ctx.sender(),
+        room_id: p.room_id,
+        pos_x: x,
+        pos_z: z,
+        yaw: 0.0,
+        speed: 0.0,
+        throttle: 0.0,
+        steer: 0.0,
+        buried: false,
+        boarding: None,
+        board_progress: 0.0,
+        disarm_done: false,
+    });
+    Ok(())
+}
+
+#[reducer]
+pub fn toggle_bury(ctx: &ReducerContext) -> Result<(), String> {
+    let mut r = ctx.db.raider().identity().find(ctx.sender()).ok_or("not on foot")?;
+    if r.boarding.is_some() {
+        return Err("you're on a deck".into());
+    }
+    r.buried = !r.buried;
+    r.speed = 0.0;
+    r.throttle = 0.0;
+    ctx.db.raider().identity().update(r);
+    Ok(())
+}
+
+#[reducer]
+pub fn board(ctx: &ReducerContext) -> Result<(), String> {
+    let mut r = ctx.db.raider().identity().find(ctx.sender()).ok_or("not on foot")?;
+    if r.boarding.is_some() {
+        return Err("already aboard".into());
+    }
+    let target = ctx.db.trampler().room_id().filter(&r.room_id)
+        .filter(|t| t.hp_engine > 0
+            && t.owner != ctx.sender()
+            && !FRAME_FLYING[(t.frame_id as usize).min(FRAME_FLYING.len() - 1)])
+        .map(|t| {
+            let d2 = (t.pos_x - r.pos_x).powi(2) + (t.pos_z - r.pos_z).powi(2);
+            (t.id, d2)
+        })
+        .filter(|(_, d2)| *d2 <= BOARD_RANGE * BOARD_RANGE)
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    let (tid, _) = target.ok_or("no trampler in reach")?;
+    r.boarding = Some(tid);
+    r.board_progress = 0.0;
+    r.disarm_done = false;
+    r.buried = false;
+    r.speed = 0.0;
+    ctx.db.raider().identity().update(r);
+    Ok(())
+}
+
+#[reducer]
+pub fn repel(ctx: &ReducerContext) -> Result<(), String> {
+    let p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+    let id = p.trampler_id.ok_or("no trampler")?;
+    let t = ctx.db.trampler().id().find(id).ok_or("trampler gone")?;
+    let mut thrown = 0;
+    for mut r in ctx.db.raider().room_id().filter(&t.room_id)
+        .filter(|r| r.boarding == Some(id)).collect::<Vec<_>>() {
+        r.boarding = None;
+        r.board_progress = 0.0;
+        // dumped off the stern
+        r.pos_x = t.pos_x - t.yaw.sin() * 10.0;
+        r.pos_z = t.pos_z - t.yaw.cos() * 10.0;
+        ctx.db.raider().identity().update(r);
+        thrown += 1;
+    }
+    if thrown == 0 {
+        return Err("deck is clear".into());
+    }
+    Ok(())
+}
+
+#[reducer]
+pub fn buy_thopter(ctx: &ReducerContext) -> Result<(), String> {
+    let mut v = ctx.db.vault().identity().find(ctx.sender())
+        .ok_or("nothing banked yet")?;
+    if v.thopter_unlocked {
+        return Err("already unlocked".into());
+    }
+    if v.salvage < THOPTER_COST {
+        return Err("not enough banked salvage".into());
+    }
+    v.salvage -= THOPTER_COST;
+    v.thopter_unlocked = true;
+    ctx.db.vault().identity().update(v);
+    Ok(())
+}
+
+#[reducer]
 pub fn buy_fortress(ctx: &ReducerContext) -> Result<(), String> {
     let mut v = ctx.db.vault().identity().find(ctx.sender())
         .ok_or("nothing banked yet")?;
@@ -612,6 +776,7 @@ pub fn mount_gun(ctx: &ReducerContext) -> Result<(), String> {
         });
     let mut gun = gun.ok_or("no free gun stations in this room")?;
     release_guns(ctx, ctx.sender());
+    ctx.db.raider().identity().delete(&ctx.sender());
     despawn_trampler(ctx, &mut p); // crewing replaces piloting
     ctx.db.player().identity().update(p);
     gun.manned_by = Some(ctx.sender());
@@ -643,6 +808,9 @@ pub fn fire_gun(ctx: &ReducerContext, yaw: f32, pitch: f32) -> Result<(), String
     let mut t = ctx.db.trampler().id().find(g.trampler_id).ok_or("host gone")?;
     if t.hp_engine == 0 {
         return Err("host trampler is dead".into());
+    }
+    if ctx.timestamp < t.guns_disabled_until {
+        return Err("weapons sabotaged".into());
     }
     let elapsed = ctx.timestamp.duration_since(g.last_fire)
         .map(|d| d.as_micros() as i64)
@@ -747,10 +915,117 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
         t.yaw += t.steer * TURN * dt * (0.4 + 0.6 * (t.speed.abs() / 3.0).min(1.0));
         t.pos_x += t.yaw.sin() * t.speed * dt;
         t.pos_z += t.yaw.cos() * t.speed * dt;
-        // hull rides CLEARANCE above the terrain at its center; the client
-        // refines height/pitch/roll cosmetically from foot positions
-        t.pos_y = terrain_h(t.pos_x, t.pos_z) + 6.2;
+        // hull rides CLEARANCE above the terrain (or hovers, if flying); the
+        // client refines height/pitch/roll cosmetically
+        let flying = FRAME_FLYING[(t.frame_id as usize).min(FRAME_FLYING.len() - 1)];
+        t.pos_y = terrain_h(t.pos_x, t.pos_z) + if flying { HOVER_HEIGHT } else { 6.2 };
         ctx.db.trampler().id().update(t);
+    }
+
+    // raiders: on-foot movement, boarding progress, trampling
+    for mut r in ctx.db.raider().iter() {
+        if let Some(tid) = r.boarding {
+            // riding an enemy deck: progress toward sabotage, then the helm
+            let Some(mut t) = ctx.db.trampler().id().find(tid) else {
+                r.boarding = None;
+                r.board_progress = 0.0;
+                ctx.db.raider().identity().update(r);
+                continue;
+            };
+            if t.hp_engine == 0 {
+                r.boarding = None;
+                r.board_progress = 0.0;
+                r.pos_x = t.pos_x;
+                r.pos_z = t.pos_z;
+                ctx.db.raider().identity().update(r);
+                continue;
+            }
+            r.board_progress += dt;
+            if !r.disarm_done && r.board_progress >= DISARM_AT_SECS {
+                r.disarm_done = true;
+                t.guns_disabled_until =
+                    ctx.timestamp + TimeDuration::from_micros(SABOTAGE_MICROS);
+                ctx.db.trampler().id().update(t.clone());
+            }
+            if r.board_progress >= HIJACK_AT_SECS {
+                // the helm changes hands: boarder pilots, old owner hits the sand
+                let old_owner = t.owner;
+                let boarder = r.identity;
+                ctx.db.raider().identity().delete(&boarder);
+                if let Some(mut bp) = ctx.db.player().identity().find(boarder) {
+                    bp.trampler_id = Some(t.id);
+                    ctx.db.player().identity().update(bp);
+                }
+                t.owner = boarder;
+                t.throttle = 0.0;
+                t.steer = 0.0;
+                let (tx, tz, tyaw) = (t.pos_x, t.pos_z, t.yaw);
+                let room = t.room_id;
+                ctx.db.trampler().id().update(t);
+                if let Some(mut op) = ctx.db.player().identity().find(old_owner) {
+                    op.trampler_id = None;
+                    let online = op.online;
+                    ctx.db.player().identity().update(op);
+                    if online {
+                        ctx.db.raider().identity().delete(&old_owner);
+                        ctx.db.raider().insert(Raider {
+                            identity: old_owner,
+                            room_id: room,
+                            pos_x: tx - tyaw.sin() * 8.0,
+                            pos_z: tz - tyaw.cos() * 8.0,
+                            yaw: tyaw,
+                            speed: 0.0,
+                            throttle: 0.0,
+                            steer: 0.0,
+                            buried: false,
+                            boarding: None,
+                            board_progress: 0.0,
+                            disarm_done: false,
+                        });
+                    }
+                }
+                continue;
+            }
+            ctx.db.raider().identity().update(r);
+            continue;
+        }
+        if r.buried {
+            continue;
+        }
+        // same shape of integrator as tramplers, on foot
+        if r.throttle == 0.0 && r.steer == 0.0 && r.speed.abs() < 0.005 {
+            if r.speed != 0.0 {
+                r.speed = 0.0;
+                ctx.db.raider().identity().update(r);
+            }
+            continue;
+        }
+        r.speed += (r.throttle * RAIDER_SPD - r.speed)
+            * (RAIDER_ACCEL * dt / r.speed.abs().max(1.0)).min(1.0);
+        if r.throttle == 0.0 {
+            r.speed *= 0.2f32.powf(dt);
+        }
+        r.yaw += r.steer * RAIDER_TURN * dt;
+        r.pos_x += r.yaw.sin() * r.speed * dt;
+        r.pos_z += r.yaw.cos() * r.speed * dt;
+        ctx.db.raider().identity().update(r);
+    }
+
+    // trampling: a moving trampler crushes raiders underfoot (buried or not)
+    for t in ctx.db.trampler().iter() {
+        if t.hp_engine == 0 || t.speed.abs() < TRAMPLE_MIN_SPEED
+            || FRAME_FLYING[(t.frame_id as usize).min(FRAME_FLYING.len() - 1)] {
+            continue;
+        }
+        let (_, _, _, s) = frame_stats(t.frame_id);
+        let r2 = (TRAMPLE_FACTOR * s) * (TRAMPLE_FACTOR * s);
+        for r in ctx.db.raider().room_id().filter(&t.room_id)
+            .filter(|r| r.boarding.is_none()).collect::<Vec<_>>() {
+            let d2 = (r.pos_x - t.pos_x).powi(2) + (r.pos_z - t.pos_z).powi(2);
+            if d2 < r2 {
+                ctx.db.raider().identity().delete(&r.identity);
+            }
+        }
     }
 
     // integrate projectiles: ballistic arc, terrain + trampler hits, TTL
@@ -867,6 +1142,9 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
         }
         for poi in ctx.db.loot_poi().room_id().filter(&id).collect::<Vec<_>>() {
             ctx.db.loot_poi().id().delete(&poi.id);
+        }
+        for r in ctx.db.raider().room_id().filter(&id).collect::<Vec<_>>() {
+            ctx.db.raider().identity().delete(&r.identity);
         }
         ctx.db.room().id().delete(&id);
     }

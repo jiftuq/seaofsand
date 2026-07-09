@@ -1,4 +1,4 @@
-import { FRAMES, FORTRESS_COST, HULL_COLORS } from './frames';
+import { FRAMES, HULL_COLORS } from './frames';
 import type { RoomInfo } from './net';
 
 // Homepage overlay: callsign, frame + paint selection, expedition (room)
@@ -24,7 +24,7 @@ export class Lobby {
   private frameId = 1;
   private color = HULL_COLORS[0];
   private rooms: RoomInfo[] = [];
-  private fortressUnlocked = false;
+  private unlocked = [true, true, false, false];
   private banked = 0;
 
   /** enter the given room (open desert = 1n) with the chosen loadout */
@@ -32,7 +32,8 @@ export class Lobby {
   onCreate?: (roomName: string, loadout: Loadout) => void;
   /** crew a free gun station in the given room instead of piloting */
   onEnterGunner?: (roomId: bigint, name: string) => void;
-  onBuyFortress?: () => void;
+  onEnterRaider?: (roomId: bigint, name: string) => void;
+  onBuyFrame?: (frameId: number) => void;
 
   constructor() {
     this.callsignEl.value = localStorage.getItem('callsign')
@@ -44,9 +45,10 @@ export class Lobby {
       const d = document.createElement('div');
       d.className = 'frame';
       d.onclick = () => {
-        if (i === 2 && !this.fortressUnlocked) {
-          if (this.banked >= FORTRESS_COST) this.onBuyFortress?.();
-          else this.setStatus(`fortress costs ${FORTRESS_COST} banked salvage`);
+        const cost = FRAMES[i].cost ?? 0;
+        if (!this.unlocked[i]) {
+          if (this.banked >= cost) this.onBuyFrame?.(i);
+          else this.setStatus(`${FRAMES[i].name} costs ${cost} banked salvage`);
           return;
         }
         this.frameId = i;
@@ -68,6 +70,8 @@ export class Lobby {
       () => this.onEnter?.(OPEN_DESERT, this.loadout());
     document.getElementById('desertGunner')!.onclick =
       () => this.onEnterGunner?.(OPEN_DESERT, this.loadout().name);
+    document.getElementById('desertRaider')!.onclick =
+      () => this.onEnterRaider?.(OPEN_DESERT, this.loadout().name);
     document.getElementById('createRoom')!.onclick = () => {
       const name = this.roomNameEl.value.trim();
       if (!name) { this.setStatus('name your expedition first'); return; }
@@ -81,21 +85,22 @@ export class Lobby {
   private renderFrames(): void {
     FRAMES.forEach((f, i) => {
       const d = this.framesEl.children[i] as HTMLElement;
-      const locked = i === 2 && !this.fortressUnlocked;
+      const locked = !this.unlocked[i];
+      const cost = f.cost ?? 0;
       const lockLine = locked
-        ? `<br><span style="color:#fff">LOCKED — ${FORTRESS_COST} SALVAGE${this.banked >= FORTRESS_COST ? ' · CLICK TO BUY' : ''}</span>`
+        ? `<br><span style="color:#fff">LOCKED — ${cost} SALVAGE${this.banked >= cost ? ' · CLICK TO BUY' : ''}</span>`
         : '';
       d.innerHTML = `<div class="fname">${locked ? '🔒 ' : ''}${f.name}</div>
         <div class="fdesc">${f.desc}<br>spd ${f.maxSpd} · hp ${f.hp}${lockLine}</div>`;
       d.style.opacity = locked ? '0.75' : '1';
     });
-    if (!this.fortressUnlocked && this.frameId === 2) this.frameId = 1;
+    if (!this.unlocked[this.frameId]) this.frameId = 1;
     this.refreshSelection();
   }
 
-  setVault(banked: number, fortressUnlocked: boolean): void {
+  setVault(banked: number, fortressUnlocked: boolean, thopterUnlocked: boolean): void {
     this.banked = banked;
-    this.fortressUnlocked = fortressUnlocked;
+    this.unlocked = [true, true, fortressUnlocked, thopterUnlocked];
     this.setBanked(banked);
     this.renderFrames();
   }

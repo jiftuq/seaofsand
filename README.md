@@ -113,6 +113,18 @@ How it syncs, per the handoff contract:
     click fires lighter shells (12 dmg, 0.6s). Host death or despawn
     returns the gunner to the lobby. Deck-walking (`move_local`) remains
     future work.
+- [x] **Raiders & ornithopters**:
+  - *Ornithopter* (frame 3, 60 salvage to unlock): flies at 12m over the
+    dunes on flapping wings, 16 m/s, 30/30 HP, no gun seats, immune to
+    boarding — a scout and getaway craft.
+  - *Sand raiders*: "RAID ON FOOT" enters the desert as an unarmed figure
+    (4.5 m/s). C buries you into a near-invisible sand mound (immobile);
+    F within 8m of an enemy walker boards it. 3 seconds aboard cuts all
+    its weapons for 45s; 8 seconds seizes the helm — the trampler (and
+    its cargo) changes owner and the old pilot is dumped onto the sand as
+    a raider. Pilots get a BOARDERS ON DECK alarm and F sweeps the deck,
+    throwing boarders off the stern. Moving tramplers crush raiders in
+    their path — buried or not — so mind where you hide.
 - [ ] **M3 — Combat** (server-authoritative projectiles, hull/engine HP)
 - [ ] **M4 — Loot + extraction**
 - [ ] **M5 — Stakes** (persistent loot per Identity)

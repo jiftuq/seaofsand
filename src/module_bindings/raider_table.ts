@@ -12,7 +12,15 @@ import {
 
 export default __t.row({
   identity: __t.identity().primaryKey(),
-  salvage: __t.u32(),
-  fortressUnlocked: __t.bool().name("fortress_unlocked"),
-  thopterUnlocked: __t.bool().name("thopter_unlocked"),
+  roomId: __t.u64().name("room_id"),
+  posX: __t.f32().name("pos_x"),
+  posZ: __t.f32().name("pos_z"),
+  yaw: __t.f32(),
+  speed: __t.f32(),
+  throttle: __t.f32(),
+  steer: __t.f32(),
+  buried: __t.bool(),
+  boarding: __t.option(__t.u64()),
+  boardProgress: __t.f32().name("board_progress"),
+  disarmDone: __t.bool().name("disarm_done"),
 });

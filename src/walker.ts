@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import { terrainH } from './terrain';
-import { FRAMES, GUN_SLOT_OFFSETS } from './frames';
+import { FRAMES, GUN_SLOT_OFFSETS, HOVER_HEIGHT } from './frames';
 
 // N-leg walker: two-bone IK (law of cosines), tripod gait, feet planted in
 // world space. Purely cosmetic — the server only ever syncs pos/yaw/speed;
@@ -83,6 +83,8 @@ export class Walker {
   private smokeT = 0;
   private steerAbs = 0;
   private frameScale: number;
+  readonly flying: boolean;
+  private wings: THREE.Mesh[] = [];
   private gunMounts = new Map<number, { yaw: THREE.Group; pitch: THREE.Group; muzzle: THREE.Object3D }>();
 
   constructor(private scene: THREE.Scene, frameId = 1, color?: number) {
@@ -91,6 +93,7 @@ export class Walker {
     const legScale = Math.sqrt(s);
     this.maxSpd = frame.maxSpd;
     this.frameScale = s;
+    this.flying = !!frame.flying;
     this.l1 = BASE_L1 * legScale;
     this.l2 = BASE_L2 * legScale;
     this.clearance = BASE_CLEARANCE * legScale;
@@ -124,6 +127,20 @@ export class Walker {
     this.turretPitch.add(barrel);
     this.muzzle.position.set(0, 0, 4.4 * s);
     this.turretPitch.add(this.muzzle);
+
+    if (this.flying) {
+      // ornithopter: hinged flapping wings instead of legs
+      for (const side of [-1, 1]) {
+        const wing = new THREE.Mesh(new THREE.BoxGeometry(9 * s, 0.22 * s, 3.4 * s), mats.dark);
+        wing.geometry.translate(side * 4.5 * s, 0, 0); // hinge at the hull
+        wing.position.set(side * 3.0 * s, 1.2 * s, 0.6 * s);
+        wing.castShadow = true;
+        this.bodyRig.add(wing);
+        this.wings.push(wing);
+      }
+      this.root.updateMatrixWorld(true);
+      return;
+    }
 
     // legs: legPairs rows of two, hips spread evenly along the hull
     const rows = frame.legPairs;
@@ -211,6 +228,7 @@ export class Walker {
   snapFeet(): void {
     this.root.rotation.y = this.yaw;
     this.root.updateMatrixWorld(true);
+    if (this.flying) return;
     for (const leg of this.legs) {
       const w = leg.restLocal.clone().applyMatrix4(this.root.matrixWorld);
       w.y = terrainH(w.x, w.z);
@@ -224,6 +242,31 @@ export class Walker {
     this.recoil = Math.max(0, this.recoil - dt * 1.2);
     this.root.rotation.y = this.yaw;
     this.root.updateMatrixWorld();
+
+    if (this.flying) {
+      this.gaitPhase += dt * (6 + this.speedAbs * 0.8);
+      const flap = Math.sin(this.gaitPhase * 2.4) * (0.35 + 0.1 * Math.min(1, this.speedAbs / 8));
+      if (this.wings[0]) this.wings[0].rotation.z = -flap;
+      if (this.wings[1]) this.wings[1].rotation.z = flap;
+      const groundY = terrainH(this.root.position.x, this.root.position.z);
+      const bob = Math.sin(this.gaitPhase * 0.5) * 0.5;
+      const targetY = this.dead ? groundY + 1.2 : groundY + HOVER_HEIGHT + bob;
+      this.root.position.y = THREE.MathUtils.lerp(
+        this.root.position.y || targetY, targetY, this.dead ? 0.03 : 0.08);
+      this.bodyRig.rotation.x = THREE.MathUtils.lerp(
+        this.bodyRig.rotation.x, -this.speed * 0.02 - this.recoil * 0.15, 0.08);
+      this.bodyRig.rotation.z = THREE.MathUtils.lerp(
+        this.bodyRig.rotation.z, this.steerAbs * 0.1 * Math.sign(-this.speed || 1), 0.05);
+      this.root.updateMatrixWorld();
+      this.smokeT -= dt;
+      if (this.smokeT < 0 && this.speedAbs > 0.5 && !this.dead) {
+        this.smokeT = 0.25;
+        const sp = new THREE.Vector3();
+        this.stackTip.getWorldPosition(sp);
+        this.onSmokePuff?.(sp);
+      }
+      return;
+    }
 
     if (this.dead) {
       // legs go limp: no gait, hull sinks to the sand and lists to one side
