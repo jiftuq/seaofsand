@@ -125,6 +125,13 @@ How it syncs, per the handoff contract:
     a raider. Pilots get a BOARDERS ON DECK alarm and F sweeps the deck,
     throwing boarders off the stern. Moving tramplers crush raiders in
     their path — buried or not — so mind where you hide.
+  - *Field crew movement*: G dismounts in place — the hull stays parked
+    where it stands (owned, boardable, stealable) while you go on foot;
+    F beside your own hull remounts it; G beside any other trampler with
+    a free gun seat mans that gun from the sand; gunners G off the deck
+    the same way. Parked hulls are cleaned up when their owner leaves the
+    room, disconnects, or spawns something new; hijacking scuttles any
+    hull the boarder left parked elsewhere.
 - [ ] **M3 — Combat** (server-authoritative projectiles, hull/engine HP)
 - [ ] **M4 — Loot + extraction**
 - [ ] **M5 — Stakes** (persistent loot per Identity)

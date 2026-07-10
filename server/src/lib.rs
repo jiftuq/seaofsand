@@ -347,6 +347,32 @@ fn despawn_trampler(ctx: &ReducerContext, p: &mut Player) {
     }
 }
 
+/// Despawn every trampler this identity owns — including hulls left parked
+/// in the field after a dismount (trampler_id = None but owner = identity).
+fn despawn_owned(ctx: &ReducerContext, identity: Identity) {
+    for t in ctx.db.trampler().iter().filter(|t| t.owner == identity).collect::<Vec<_>>() {
+        drop_trampler_side_tables(ctx, t.id);
+        ctx.db.trampler().id().delete(&t.id);
+    }
+    if let Some(mut p) = ctx.db.player().identity().find(identity) {
+        if p.trampler_id.is_some() {
+            p.trampler_id = None;
+            ctx.db.player().identity().update(p);
+        }
+    }
+}
+
+fn insert_raider_at(ctx: &ReducerContext, identity: Identity, room_id: u64,
+                    x: f32, z: f32, yaw: f32) {
+    ctx.db.raider().identity().delete(&identity);
+    ctx.db.raider().insert(Raider {
+        identity, room_id,
+        pos_x: x, pos_z: z, yaw,
+        speed: 0.0, throttle: 0.0, steer: 0.0,
+        buried: false, boarding: None, board_progress: 0.0, disarm_done: false,
+    });
+}
+
 #[reducer(client_connected)]
 pub fn client_connected(ctx: &ReducerContext) {
     if let Some(mut p) = ctx.db.player().identity().find(ctx.sender()) {
@@ -361,9 +387,10 @@ pub fn client_disconnected(ctx: &ReducerContext) {
         p.online = false;
         release_guns(ctx, ctx.sender());
         ctx.db.raider().identity().delete(&ctx.sender());
-        despawn_trampler(ctx, &mut p);
+        p.trampler_id = None;
         p.room_id = OPEN_DESERT;
         ctx.db.player().identity().update(p);
+        despawn_owned(ctx, ctx.sender());
     }
 }
 
@@ -405,7 +432,9 @@ pub fn create_room(ctx: &ReducerContext, name: String) -> Result<(), String> {
     seed_pois(ctx, room.id);
     release_guns(ctx, ctx.sender());
     ctx.db.raider().identity().delete(&ctx.sender());
-    despawn_trampler(ctx, &mut p);
+    p.trampler_id = None;
+    despawn_owned(ctx, ctx.sender());
+    let mut p = ctx.db.player().identity().find(ctx.sender()).unwrap();
     p.room_id = room.id;
     ctx.db.player().identity().update(p);
     Ok(())
@@ -423,7 +452,9 @@ pub fn join_room(ctx: &ReducerContext, room_id: u64) -> Result<(), String> {
     }
     release_guns(ctx, ctx.sender());
     ctx.db.raider().identity().delete(&ctx.sender());
-    despawn_trampler(ctx, &mut p);
+    p.trampler_id = None;
+    despawn_owned(ctx, ctx.sender());
+    let mut p = ctx.db.player().identity().find(ctx.sender()).unwrap();
     p.room_id = room_id;
     ctx.db.player().identity().update(p);
     Ok(())
@@ -447,7 +478,9 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
     }
     release_guns(ctx, ctx.sender());
     ctx.db.raider().identity().delete(&ctx.sender());
-    despawn_trampler(ctx, &mut p); // respawn = replace
+    p.trampler_id = None;
+    despawn_owned(ctx, ctx.sender()); // respawn = replace, parked hulls included
+    let mut p = ctx.db.player().identity().find(ctx.sender()).unwrap();
     let (_, hull, engine, _) = frame_stats(frame_id);
     // deterministic-ish scatter so spawns in a room don't overlap
     let n = ctx.db.trampler().count() as f32 + p.room_id as f32;
@@ -620,10 +653,10 @@ pub fn loot(ctx: &ReducerContext, poi_id: u64) -> Result<(), String> {
 
 #[reducer]
 pub fn spawn_raider(ctx: &ReducerContext) -> Result<(), String> {
-    let mut p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+    let p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+    let _ = p;
     release_guns(ctx, ctx.sender());
-    despawn_trampler(ctx, &mut p);
-    ctx.db.player().identity().update(p);
+    despawn_owned(ctx, ctx.sender());
     let p = ctx.db.player().identity().find(ctx.sender()).unwrap();
     ctx.db.raider().identity().delete(&ctx.sender());
     let n = ctx.db.raider().count() as f32 + p.room_id as f32 * 3.0;
@@ -664,6 +697,20 @@ pub fn board(ctx: &ReducerContext) -> Result<(), String> {
     let mut r = ctx.db.raider().identity().find(ctx.sender()).ok_or("not on foot")?;
     if r.boarding.is_some() {
         return Err("already aboard".into());
+    }
+    // our own parked hull within reach? climb back to the helm
+    let own = ctx.db.trampler().room_id().filter(&r.room_id)
+        .filter(|t| t.owner == ctx.sender() && t.hp_engine > 0)
+        .find(|t| {
+            (t.pos_x - r.pos_x).powi(2) + (t.pos_z - r.pos_z).powi(2)
+                <= BOARD_RANGE * BOARD_RANGE
+        });
+    if let Some(t) = own {
+        ctx.db.raider().identity().delete(&ctx.sender());
+        let mut p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+        p.trampler_id = Some(t.id);
+        ctx.db.player().identity().update(p);
+        return Ok(());
     }
     let target = ctx.db.trampler().room_id().filter(&r.room_id)
         .filter(|t| t.hp_engine > 0
@@ -766,12 +813,19 @@ pub fn field_repair(ctx: &ReducerContext) -> Result<(), String> {
 #[reducer]
 pub fn mount_gun(ctx: &ReducerContext) -> Result<(), String> {
     let mut p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
-    // find a free station on a living trampler in our room (not our own)
+    // from on foot only stations within arm's reach count; from the lobby,
+    // any free station in the room
+    let near = ctx.db.raider().identity().find(ctx.sender())
+        .map(|r| (r.pos_x, r.pos_z));
     let gun = ctx.db.mounted_gun().room_id().filter(&p.room_id)
         .filter(|g| g.manned_by.is_none())
         .find(|g| {
             ctx.db.trampler().id().find(g.trampler_id)
-                .map(|t| t.hp_engine > 0 && t.owner != ctx.sender())
+                .map(|t| t.hp_engine > 0 && t.owner != ctx.sender()
+                    && near.map(|(rx, rz)| {
+                        (t.pos_x - rx).powi(2) + (t.pos_z - rz).powi(2)
+                            <= BOARD_RANGE * BOARD_RANGE
+                    }).unwrap_or(true))
                 .unwrap_or(false)
         });
     let mut gun = gun.ok_or("no free gun stations in this room")?;
@@ -785,8 +839,34 @@ pub fn mount_gun(ctx: &ReducerContext) -> Result<(), String> {
 }
 
 #[reducer]
-pub fn dismount(ctx: &ReducerContext) {
-    release_guns(ctx, ctx.sender());
+pub fn dismount(ctx: &ReducerContext) -> Result<(), String> {
+    let mut p = ctx.db.player().identity().find(ctx.sender()).ok_or("join first")?;
+    // gunner: step off the host trampler
+    if let Some(g) = ctx.db.mounted_gun().iter()
+        .find(|g| g.manned_by == Some(ctx.sender())) {
+        let host = ctx.db.trampler().id().find(g.trampler_id).ok_or("host gone")?;
+        release_guns(ctx, ctx.sender());
+        insert_raider_at(ctx, ctx.sender(), host.room_id,
+            host.pos_x - host.yaw.sin() * 8.0,
+            host.pos_z - host.yaw.cos() * 8.0,
+            host.yaw);
+        return Ok(());
+    }
+    // pilot: park the hull where it stands and hop off
+    let id = p.trampler_id.ok_or("nothing to dismount")?;
+    let mut t = ctx.db.trampler().id().find(id).ok_or("trampler gone")?;
+    if t.hp_engine == 0 {
+        return Err("trampler is dead".into());
+    }
+    t.throttle = 0.0;
+    t.steer = 0.0;
+    let (x, z, yaw, room) = (t.pos_x, t.pos_z, t.yaw, t.room_id);
+    ctx.db.trampler().id().update(t);
+    p.trampler_id = None;
+    ctx.db.player().identity().update(p);
+    insert_raider_at(ctx, ctx.sender(), room,
+        x - yaw.sin() * 8.0, z - yaw.cos() * 8.0, yaw);
+    Ok(())
 }
 
 #[reducer]
@@ -952,6 +1032,12 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
                 let old_owner = t.owner;
                 let boarder = r.identity;
                 ctx.db.raider().identity().delete(&boarder);
+                // a boarder can't own two hulls: scuttle any they left parked
+                for old in ctx.db.trampler().iter()
+                    .filter(|o| o.owner == boarder).collect::<Vec<_>>() {
+                    drop_trampler_side_tables(ctx, old.id);
+                    ctx.db.trampler().id().delete(&old.id);
+                }
                 if let Some(mut bp) = ctx.db.player().identity().find(boarder) {
                     bp.trampler_id = Some(t.id);
                     ctx.db.player().identity().update(bp);

@@ -8,6 +8,7 @@ export class Input {
   onRepair?: () => void;
   onBoardRepel?: () => void;
   onBury?: () => void;
+  onAux?: () => void; // G: dismount / man a nearby gun
 
   constructor() {
     addEventListener('keydown', e => {
@@ -17,6 +18,7 @@ export class Input {
       if (e.code === 'KeyR') this.onRepair?.();
       if (e.code === 'KeyF') this.onBoardRepel?.();
       if (e.code === 'KeyC') this.onBury?.();
+      if (e.code === 'KeyG') this.onAux?.();
     });
     addEventListener('keydown', e => { this.keys[e.code] = true; });
     addEventListener('keyup', e => { this.keys[e.code] = false; });

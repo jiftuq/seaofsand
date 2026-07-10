@@ -119,6 +119,24 @@ input.onBoardRepel = () => {
   }
 };
 
+input.onAux = () => {
+  if (lobby.visible) return;
+  if (net.ownRaider) {
+    // man a free gun station within reach
+    net.mountGun()
+      .then(() => hud.flash('GUN STATION MANNED — MOUSE AIM, CLICK FIRE'))
+      .catch(e => hud.flash(String(e?.message ?? e).toUpperCase()));
+  } else if (net.ownGun) {
+    net.dismount()
+      .then(() => hud.flash('STEPPED OFF — ON FOOT'))
+      .catch(() => {});
+  } else if (walker && !walker.dead && net.ownState) {
+    net.dismount()
+      .then(() => hud.flash('GONE OVERBOARD — HULL PARKED HERE'))
+      .catch(e => hud.flash(String(e?.message ?? e).toUpperCase()));
+  }
+};
+
 input.onBury = () => {
   if (lobby.visible || !net.ownRaider) return;
   net.toggleBury().catch(e => hud.flash(String(e?.message ?? e).toUpperCase()));
@@ -337,17 +355,22 @@ function animate(): void {
   const throttle = lobby.visible || walker?.dead ? 0 : input.throttle;
   const steer = lobby.visible || walker?.dead ? 0 : input.steer;
 
+  const piloting = !!walker && !net.ownRaider && !net.ownGun;
+
   if (walker) {
     // own trampler: predict locally, reconcile toward server.
     // Substep the integrator so slow frames don't dilate simulated time —
     // the server integrates in real time and we must match it.
-    if (!walker.dead) {
+    // (While dismounted the hull is parked: reconcile only, no driving.)
+    if (!walker.dead && piloting) {
       for (let rem = rawDt; rem > 0; rem -= 0.05) {
         walker.drive(Math.min(rem, 0.05), throttle, steer);
       }
     }
-    net.sendInput(throttle, steer,
-      walker.turretYaw.rotation.y, walker.turretPitch.rotation.x, now);
+    if (piloting) {
+      net.sendInput(throttle, steer,
+        walker.turretYaw.rotation.y, walker.turretPitch.rotation.x, now);
+    }
     const own = net.ownState;
     if (own && !walker.dead) {
       const ex = own.x - walker.root.position.x;
@@ -364,7 +387,7 @@ function animate(): void {
       }
     }
     walker.animate(dt);
-    if (!walker.dead) walker.aimTurret(input.mouseX, input.mouseY);
+    if (!walker.dead && piloting) walker.aimTurret(input.mouseX, input.mouseY);
   }
 
   gunnerCooldown = Math.max(0, gunnerCooldown - dt);
@@ -494,14 +517,26 @@ function animate(): void {
     } else if (r.buried) {
       hud.setContext('BURIED — [C] SURFACE');
     } else {
-      let near = Infinity;
+      const ownHull = net.ownState
+        ? Math.hypot(net.ownState.x - ownRaiderPose.x, net.ownState.z - ownRaiderPose.z)
+        : Infinity;
+      let nearEnemy = Infinity;
+      let nearEnemyId: bigint | null = null;
       for (const t of net.remotes.values()) {
         const s = t.buffer[t.buffer.length - 1];
         if (s && t.hpEngine > 0) {
-          near = Math.min(near, Math.hypot(s.x - ownRaiderPose.x, s.z - ownRaiderPose.z));
+          const d = Math.hypot(s.x - ownRaiderPose.x, s.z - ownRaiderPose.z);
+          if (d < nearEnemy) { nearEnemy = d; nearEnemyId = t.id; }
         }
       }
-      hud.setContext(near <= 8 ? '[F] BOARD THE TRAMPLER' : '[C] BURY · SNEAK CLOSE TO BOARD');
+      const freeSeat = nearEnemyId !== null && nearEnemy <= 8
+        && [...net.guns.values()].some(g => g.tramplerId === nearEnemyId && !g.manned);
+      if (ownHull <= 8) hud.setContext('[F] REMOUNT YOUR TRAMPLER');
+      else if (nearEnemy <= 8) {
+        hud.setContext(freeSeat ? '[F] BOARD · [G] MAN THEIR GUN' : '[F] BOARD THE TRAMPLER');
+      } else {
+        hud.setContext('[C] BURY · SNEAK CLOSE TO BOARD');
+      }
     }
   }
   // HUD context line: extraction countdown wins, else nearby-salvage hint

@@ -51,6 +51,7 @@ export interface GunInfo {
   yaw: number;
   pitch: number;
   mine: boolean;
+  manned: boolean;
 }
 
 export interface ProjectileSpawn {
@@ -298,7 +299,7 @@ export class Net {
     const mine = !!(this.identity && row.mannedBy && row.mannedBy.isEqual(this.identity));
     const g: GunInfo = {
       id: row.id, tramplerId: row.tramplerId, slot: row.slot,
-      yaw: row.yaw, pitch: row.pitch, mine,
+      yaw: row.yaw, pitch: row.pitch, mine, manned: !!row.mannedBy,
     };
     this.guns.set(row.id, g);
     const wasMine = this.ownGun?.id === row.id;
@@ -574,8 +575,9 @@ export class Net {
     return this.conn.reducers.mountGun({});
   }
 
-  dismount(): void {
-    this.conn?.reducers.dismount({}).catch(() => {});
+  dismount(): Promise<void> {
+    if (!this.conn) return Promise.reject(new Error('offline'));
+    return this.conn.reducers.dismount({});
   }
 
   private lastAimSent = 0;
