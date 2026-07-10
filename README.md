@@ -138,9 +138,22 @@ How it syncs, per the handoff contract:
 
 ## Layout
 
+## Map
+
+One handcrafted desert, ~2.2km playable diameter (hard edge at r=1100m —
+drive into it and you grind to a halt). 42 deterministic rock formations
+big enough to hide a trampler behind, with server-authoritative circle
+colliders; four oases (7m-deep bowls carved into the heightfield, water,
+palms, reeds). Terrain math and collider layout are mirrored between
+`src/map.ts`/`src/terrain.ts` and `server/src/lib.rs`: formation placement
+runs a mulberry32 PRNG over u32 arithmetic with f64 squared-distance
+rejection sampling, so both languages generate bit-identical layouts (the
+module logs a fingerprint on init to check against the client).
+
 | module | responsibility |
 | --- | --- |
-| `src/terrain.ts` | analytic dune heightfield `terrainH(x,z)` + mesh. This function IS the physics; the server must implement it identically. |
+| `src/map.ts` | shared map data: bounds, oases, deterministic rock colliders, collision resolve (mirrored in Rust) |
+| `src/terrain.ts` | analytic dune heightfield `terrainH(x,z)` + mesh, oasis water/palms, rock formation rendering. The heightfield IS the physics; the server implements it identically. |
 | `src/walker.ts` | trampler build, drive integrator, tripod gait, two-bone leg IK. Cosmetic only — never networked; clients derive gait from pos/yaw/speed. |
 | `src/combat.ts` | shell rendering for server projectiles; offline practice range |
 | `src/net.ts` | SpacetimeDB connection, snapshot buffers, room subscriptions, input send |

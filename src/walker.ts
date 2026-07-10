@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { terrainH } from './terrain';
 import { FRAMES, GUN_SLOT_OFFSETS, HOVER_HEIGHT } from './frames';
+import { clampMapEdge, resolveCollision } from './map';
 
 // N-leg walker: two-bone IK (law of cosines), tripod gait, feet planted in
 // world space. Purely cosmetic — the server only ever syncs pos/yaw/speed;
@@ -71,6 +72,7 @@ export class Walker {
 
   onFootfall?: (pos: THREE.Vector3) => void;
   onSmokePuff?: (pos: THREE.Vector3) => void;
+  onBlocked?: () => void;
 
   readonly maxSpd: number;
   private readonly l1: number;
@@ -210,6 +212,15 @@ export class Walker {
     // forward is +Z at yaw=0 (matches turret facing); clean single integrator
     this.root.position.x += Math.sin(this.yaw) * this.speed * dt;
     this.root.position.z += Math.cos(this.yaw) * this.speed * dt;
+    // rocks and the map edge push back (server applies the same rule on
+    // tick); ornithopters fly over the rocks but not past the edge
+    const blocked = this.flying
+      ? clampMapEdge(this.root.position)
+      : resolveCollision(this.root.position);
+    if (blocked) {
+      this.speed *= Math.pow(0.05, dt); // grind to a halt against the obstacle
+      this.onBlocked?.();
+    }
     this.steerAbs = Math.abs(steer);
   }
 

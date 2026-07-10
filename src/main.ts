@@ -9,11 +9,12 @@ import { Net } from './net';
 import { Lobby, type Loadout } from './lobby';
 import { LootSites } from './loot';
 import { RaiderMesh } from './raider';
+import { CLUSTERS } from './map';
 
 // ---------- scene ----------
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xd8a86b);
-scene.fog = new THREE.FogExp2(0xd8a86b, 0.0038);
+scene.fog = new THREE.FogExp2(0xd8a86b, 0.0030);
 
 const camera = new THREE.PerspectiveCamera(62, innerWidth / innerHeight, 0.1, 2000);
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -31,6 +32,7 @@ sun.shadow.camera.left = -80; sun.shadow.camera.right = 80;
 sun.shadow.camera.top = 80; sun.shadow.camera.bottom = -80;
 sun.shadow.camera.far = 500;
 scene.add(sun);
+scene.add(sun.target); // sun follows the walker so shadows work map-wide
 scene.add(new THREE.HemisphereLight(0xf2c98a, 0x6b4a2a, 0.55));
 
 buildTerrain(scene);
@@ -64,6 +66,7 @@ function buildOwnWalker(frameId: number, color: number): Walker {
   walker?.dispose();
   const w = new Walker(scene, frameId, color);
   hookWalkerEffects(w);
+  w.onBlocked = flashBlocked; // rocks/map edge feedback, own trampler only
   walker = w;
   return w;
 }
@@ -143,6 +146,16 @@ input.onBury = () => {
 };
 
 let gunnerCooldown = 0;
+
+let blockedFlashT = 0;
+function flashBlocked(): void {
+  const t = performance.now();
+  if (t - blockedFlashT > 4000) {
+    blockedFlashT = t;
+    hud.flash('HULL SCRAPING — REVERSE COURSE');
+  }
+}
+
 
 input.onFire = () => {
   if (lobby.visible) return;
@@ -614,6 +627,10 @@ function animate(): void {
     camera.lookAt(Math.sin(t + 0.6) * 40, 4, Math.cos(t + 0.6) * 40);
   }
 
+  // sun + shadow frustum track whatever the camera is following
+  sun.position.copy(camera.position).add(new THREE.Vector3(120, 171, 60));
+  sun.target.position.copy(camera.position);
+
   renderer.render(scene, camera);
 }
 
@@ -634,7 +651,10 @@ declare global {
       lobby: Lobby;
       combat: Combat;
       remoteWalkers: Map<bigint, Walker>;
+      clusters: typeof CLUSTERS;
     };
   }
 }
-window.__sos = { getWalker: () => walker, net, lobby, combat, remoteWalkers };
+window.__sos = {
+  getWalker: () => walker, net, lobby, combat, remoteWalkers, clusters: CLUSTERS,
+};

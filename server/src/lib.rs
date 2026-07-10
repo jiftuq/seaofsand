@@ -88,12 +88,133 @@ fn gun_slot_offset(slot: u8) -> (f32, f32, f32) {
     }
 }
 
+// ---- shared map definition (MUST match src/map.ts + src/terrain.ts) ----
+
+const MAP_R: f64 = 1100.0;
+const HULL_R: f64 = 4.5;
+
+/// (x, z, r) oasis bowls carved into the heightfield.
+const OASES: [(f32, f32, f32); 4] = [
+    (250.0, -180.0, 45.0),
+    (-380.0, 320.0, 55.0),
+    (620.0, 480.0, 40.0),
+    (-520.0, -610.0, 50.0),
+];
+
 /// Analytic dune heightfield. MUST match `terrainH` in src/terrain.ts exactly —
 /// this function is the physics on both sides of the wire.
 fn terrain_h(x: f32, z: f32) -> f32 {
-    (x * 0.018).sin() * (z * 0.022).cos() * 7.0
+    let mut h = (x * 0.018).sin() * (z * 0.022).cos() * 7.0
         + (x * 0.05 + z * 0.03).sin() * 2.4
-        + (x * 0.11).sin() * (z * 0.13).sin() * 0.8
+        + (x * 0.11).sin() * (z * 0.13).sin() * 0.8;
+    for (ox, oz, or) in OASES {
+        let dx = x - ox;
+        let dz = z - oz;
+        let d2 = dx * dx + dz * dz;
+        if d2 < or * or {
+            let d = d2.sqrt() / or;
+            let s = d * d * (3.0 - 2.0 * d);
+            h -= 7.0 * (1.0 - s);
+        }
+    }
+    h
+}
+
+/// mulberry32 — bit-identical to `mulberry32` in src/map.ts.
+struct Mulberry32(u32);
+impl Mulberry32 {
+    fn next(&mut self) -> f64 {
+        self.0 = self.0.wrapping_add(0x6d2b79f5);
+        let a = self.0;
+        let mut t = (a ^ (a >> 15)).wrapping_mul(1 | a);
+        t = t.wrapping_add((t ^ (t >> 7)).wrapping_mul(61 | t)) ^ t;
+        (t ^ (t >> 14)) as f64 / 4294967296.0
+    }
+}
+
+/// Rock-formation colliders (x, z, r). Same rejection-sampled layout as
+/// `genClusters` in src/map.ts: every attempt draws exactly 3 randoms and all
+/// accept/reject math is f64 with squared distances, so both languages take
+/// identical branches.
+fn clusters() -> &'static Vec<(f64, f64, f64)> {
+    static CLUSTERS: std::sync::OnceLock<Vec<(f64, f64, f64)>> = std::sync::OnceLock::new();
+    CLUSTERS.get_or_init(|| {
+        let mut rand = Mulberry32(1337);
+        let mut out: Vec<(f64, f64, f64)> = Vec::new();
+        let mut attempts = 0;
+        while out.len() < 42 && attempts < 500 {
+            attempts += 1;
+            let x = (rand.next() * 2.0 - 1.0) * 1000.0;
+            let z = (rand.next() * 2.0 - 1.0) * 1000.0;
+            let r = 10.0 + rand.next() * 18.0;
+            if x * x + z * z > 1000.0 * 1000.0 {
+                continue;
+            }
+            if x * x + z * z < 120.0 * 120.0 {
+                continue;
+            }
+            if OASES.iter().any(|&(ox, oz, or)| {
+                let dx = x - ox as f64;
+                let dz = z - oz as f64;
+                let m = or as f64 + r + 25.0;
+                dx * dx + dz * dz < m * m
+            }) {
+                continue;
+            }
+            if out.iter().any(|&(cx, cz, cr)| {
+                let dx = x - cx;
+                let dz = z - cz;
+                let m = cr + r + 15.0;
+                dx * dx + dz * dz < m * m
+            }) {
+                continue;
+            }
+            out.push((x, z, r));
+        }
+        out
+    })
+}
+
+/// Push a point out of rock colliders and back inside the map edge.
+/// Mirror of `resolveCollision` in src/map.ts.
+fn resolve_collision_r(px: &mut f32, pz: &mut f32, radius: f64) -> bool {
+    let mut x = *px as f64;
+    let mut z = *pz as f64;
+    let mut touched = false;
+    for &(cx, cz, cr) in clusters() {
+        let dx = x - cx;
+        let dz = z - cz;
+        let rr = cr + radius;
+        let d2 = dx * dx + dz * dz;
+        if d2 < rr * rr && d2 > 1e-9 {
+            let d = d2.sqrt();
+            x = cx + dx / d * rr;
+            z = cz + dz / d * rr;
+            touched = true;
+        }
+    }
+    *px = x as f32;
+    *pz = z as f32;
+    clamp_map_edge(px, pz) || touched
+}
+
+fn resolve_collision(px: &mut f32, pz: &mut f32) -> bool {
+    resolve_collision_r(px, pz, HULL_R)
+}
+
+/// Keep a point inside the map edge. Flying frames skip rock colliders but
+/// still respect this.
+fn clamp_map_edge(px: &mut f32, pz: &mut f32) -> bool {
+    let x = *px as f64;
+    let z = *pz as f64;
+    let d2 = x * x + z * z;
+    if d2 > MAP_R * MAP_R {
+        let d = d2.sqrt();
+        *px = (x / d * MAP_R) as f32;
+        *pz = (z / d * MAP_R) as f32;
+        return true;
+    }
+    false
 }
 
 #[table(accessor = room, public)]
@@ -287,6 +408,14 @@ pub fn init(ctx: &ReducerContext) {
         max_players: MAX_PLAYERS_PER_ROOM,
     });
     seed_pois(ctx, OPEN_DESERT);
+    // layout fingerprint — compare against the client's map.ts output
+    let cs = clusters();
+    log::info!(
+        "map: {} clusters, first={:?}, last={:?}",
+        cs.len(),
+        cs.first(),
+        cs.last()
+    );
 }
 
 fn online_count(ctx: &ReducerContext, room_id: u64) -> u32 {
@@ -300,11 +429,15 @@ fn seed_pois(ctx: &ReducerContext, room_id: u64) {
         let hx = ((seed * 12.9898).sin() * 43_758.547).rem_euclid(1.0);
         let hz = ((seed * 78.233).sin() * 43_758.547).rem_euclid(1.0);
         let item_type = POI_TYPE_PATTERN[(i as usize) % POI_TYPE_PATTERN.len()];
+        // keep sites out of rock formations so they stay reachable
+        let mut px = hx * 280.0 - 140.0;
+        let mut pz = hz * 280.0 - 140.0;
+        resolve_collision_r(&mut px, &mut pz, 10.0);
         ctx.db.loot_poi().insert(LootPoi {
             id: 0,
             room_id,
-            pos_x: hx * 280.0 - 140.0,
-            pos_z: hz * 280.0 - 140.0,
+            pos_x: px,
+            pos_z: pz,
             item_type,
             remaining: POI_AMOUNTS[item_type as usize],
         });
@@ -482,10 +615,12 @@ pub fn spawn_trampler(ctx: &ReducerContext, frame_id: u32, color: u32) -> Result
     despawn_owned(ctx, ctx.sender()); // respawn = replace, parked hulls included
     let mut p = ctx.db.player().identity().find(ctx.sender()).unwrap();
     let (_, hull, engine, _) = frame_stats(frame_id);
-    // deterministic-ish scatter so spawns in a room don't overlap
+    // deterministic-ish scatter so spawns in a room don't overlap; the spawn
+    // field (r < 120 around the origin) is kept clear of rock formations
     let n = ctx.db.trampler().count() as f32 + p.room_id as f32;
-    let x = (n * 37.0) % 120.0 - 60.0;
-    let z = (n * 53.0) % 120.0 - 60.0;
+    let mut x = (n * 37.0) % 200.0 - 100.0;
+    let mut z = (n * 53.0) % 200.0 - 100.0;
+    resolve_collision(&mut x, &mut z);
     let t = ctx.db.trampler().insert(Trampler {
         id: 0,
         owner: ctx.sender(),
@@ -995,9 +1130,19 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
         t.yaw += t.steer * TURN * dt * (0.4 + 0.6 * (t.speed.abs() / 3.0).min(1.0));
         t.pos_x += t.yaw.sin() * t.speed * dt;
         t.pos_z += t.yaw.cos() * t.speed * dt;
+        // walkers grind against rocks and the map edge; ornithopters fly
+        // over the rocks but not past the edge
+        let flying = FRAME_FLYING[(t.frame_id as usize).min(FRAME_FLYING.len() - 1)];
+        let blocked = if flying {
+            clamp_map_edge(&mut t.pos_x, &mut t.pos_z)
+        } else {
+            resolve_collision(&mut t.pos_x, &mut t.pos_z)
+        };
+        if blocked {
+            t.speed *= 0.05f32.powf(dt);
+        }
         // hull rides CLEARANCE above the terrain (or hovers, if flying); the
         // client refines height/pitch/roll cosmetically
-        let flying = FRAME_FLYING[(t.frame_id as usize).min(FRAME_FLYING.len() - 1)];
         t.pos_y = terrain_h(t.pos_x, t.pos_z) + if flying { HOVER_HEIGHT } else { 6.2 };
         ctx.db.trampler().id().update(t);
     }
@@ -1094,6 +1239,10 @@ pub fn tick(ctx: &ReducerContext, _schedule: TickSchedule) -> Result<(), String>
         r.yaw += r.steer * RAIDER_TURN * dt;
         r.pos_x += r.yaw.sin() * r.speed * dt;
         r.pos_z += r.yaw.cos() * r.speed * dt;
+        // raiders squeeze closer to the rock than a trampler hull can
+        if resolve_collision_r(&mut r.pos_x, &mut r.pos_z, 1.0) {
+            r.speed *= 0.05f32.powf(dt);
+        }
         ctx.db.raider().identity().update(r);
     }
 
